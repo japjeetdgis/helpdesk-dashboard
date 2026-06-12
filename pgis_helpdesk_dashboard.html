@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PGIS Help Desk — Performance Dashboard · June 2026</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+  :root {
+    --bg: #F7F6F3;
+    --surface: #FFFFFF;
+    --border: #E2E0DA;
+    --border-dark: #C8C5BC;
+    --text: #1A1917;
+    --text-2: #6B6860;
+    --text-3: #9B9890;
+    --green: #1A7A52;
+    --green-bg: #EBF5EE;
+    --green-border: #B6DECA;
+    --amber: #92560A;
+    --amber-bg: #FEF3E2;
+    --amber-border: #F5D49A;
+    --red: #B03A2E;
+    --red-bg: #FDECEA;
+    --red-border: #F5B7B1;
+    --blue: #1D5FA8;
+    --blue-bg: #EBF2FB;
+    --accent: #2B5CE6;
+    --mono: 'IBM Plex Mono', monospace;
+    --sans: 'Inter', sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 14px; line-height: 1.5; min-height: 100vh; }
+
+  /* HEADER */
+  .header { background: var(--text); color: #fff; padding: 32px 40px; border-bottom: 3px solid var(--accent); }
+  .header-inner { max-width: 1200px; margin: 0 auto; display: flex; justify-content: space-between; align-items: flex-end; }
+  .header-left .eyebrow { font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: rgba(255,255,255,0.5); margin-bottom: 8px; }
+  .header-left h1 { font-size: 28px; font-weight: 600; letter-spacing: -0.02em; line-height: 1.1; }
+  .header-left h1 span { color: #7BA4F5; }
+  .header-right { text-align: right; }
+  .header-right .date-badge { font-family: var(--mono); font-size: 11px; background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.15); border-radius: 4px; padding: 6px 12px; color: rgba(255,255,255,0.8); display: inline-block; margin-bottom: 6px; }
+  .header-right .sub { font-size: 12px; color: rgba(255,255,255,0.4); }
+
+  /* LAYOUT */
+  .page { max-width: 1200px; margin: 0 auto; padding: 32px 40px 64px; }
+
+  /* SECTION */
+  .section { margin-bottom: 40px; }
+  .section-header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+  .section-label { font-family: var(--mono); font-size: 11px; font-weight: 500; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-2); }
+  .section-rule { flex: 1; height: 1px; background: var(--border); }
+
+  /* KPI CARDS */
+  .kpi-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
+  .kpi-grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  .kpi-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px 18px; position: relative; }
+  .kpi-card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px; background: var(--accent-color, var(--border-dark)); border-radius: 8px 8px 0 0; }
+  .kpi-card.green::before { background: var(--green); }
+  .kpi-card.amber::before { background: var(--amber); }
+  .kpi-card.red::before { background: var(--red); }
+  .kpi-card.blue::before { background: var(--blue); }
+  .kpi-label { font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-3); margin-bottom: 8px; }
+  .kpi-value { font-size: 28px; font-weight: 600; color: var(--text); letter-spacing: -0.02em; line-height: 1; margin-bottom: 6px; }
+  .kpi-sub { font-size: 12px; color: var(--text-2); }
+  .kpi-delta { display: inline-flex; align-items: center; gap: 4px; font-family: var(--mono); font-size: 11px; font-weight: 500; padding: 2px 8px; border-radius: 3px; margin-top: 6px; }
+  .delta-green { background: var(--green-bg); color: var(--green); border: 1px solid var(--green-border); }
+  .delta-amber { background: var(--amber-bg); color: var(--amber); border: 1px solid var(--amber-border); }
+  .delta-red { background: var(--red-bg); color: var(--red); border: 1px solid var(--red-border); }
+
+  /* CHARTS */
+  .chart-grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .chart-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px; }
+  .chart-card-full { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px; }
+  .chart-label { font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-3); margin-bottom: 14px; }
+  .chart-wrap { position: relative; width: 100%; }
+
+  /* TABLE */
+  .table-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  thead tr { border-bottom: 1px solid var(--border); background: #FAFAF8; }
+  th { text-align: left; padding: 10px 14px; font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-3); font-weight: 500; }
+  th.r { text-align: right; }
+  td { padding: 12px 14px; border-bottom: 1px solid var(--border); color: var(--text); }
+  td.r { text-align: right; font-family: var(--mono); font-size: 12px; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #FAFAF8; }
+  tr.best td { background: var(--green-bg); }
+  tr.best td:first-child { border-left: 3px solid var(--green); }
+  tr.worst td { background: var(--amber-bg); }
+  tr.worst td:first-child { border-left: 3px solid var(--amber); }
+
+  /* BADGE */
+  .badge { display: inline-block; font-family: var(--mono); font-size: 10px; padding: 2px 8px; border-radius: 3px; font-weight: 500; }
+  .badge-green { background: var(--green-bg); color: var(--green); border: 1px solid var(--green-border); }
+  .badge-amber { background: var(--amber-bg); color: var(--amber); border: 1px solid var(--amber-border); }
+  .badge-red   { background: var(--red-bg);   color: var(--red);   border: 1px solid var(--red-border); }
+  .badge-blue  { background: var(--blue-bg);  color: var(--blue);  border: 1px solid #B6CCE8; }
+
+  /* INSIGHT BOX */
+  .insight { background: var(--green-bg); border: 1px solid var(--green-border); border-radius: 8px; padding: 16px 20px; font-size: 13px; color: var(--text); line-height: 1.6; margin-top: 16px; }
+  .insight strong { color: var(--green); }
+
+  /* LEGEND */
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 12px; font-size: 12px; color: var(--text-2); }
+  .legend-item { display: flex; align-items: center; gap: 6px; }
+  .legend-swatch { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+  .legend-line { width: 14px; height: 2px; flex-shrink: 0; }
+
+  /* DIVIDER */
+  hr { border: none; border-top: 1px solid var(--border); margin: 32px 0; }
+
+  /* FOOTER */
+  .footer { border-top: 1px solid var(--border); padding-top: 20px; margin-top: 40px; display: flex; justify-content: space-between; align-items: center; font-family: var(--mono); font-size: 10px; color: var(--text-3); letter-spacing: 0.06em; }
+
+  @media (max-width: 900px) {
+    .header { padding: 24px 20px; }
+    .header-inner { flex-direction: column; align-items: flex-start; gap: 12px; }
+    .header-right { text-align: left; }
+    .page { padding: 24px 20px 48px; }
+    .kpi-grid, .kpi-grid-4 { grid-template-columns: repeat(2, 1fr); }
+    .chart-grid-3 { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<div class="header">
+  <div class="header-inner">
+    <div class="header-left">
+      <div class="eyebrow">Patriot Growth Insurance Services · IT Operations</div>
+      <h1>Help Desk <span>Performance</span> Dashboard</h1>
+    </div>
+    <div class="header-right">
+      <div class="date-badge">June 2026 · Week-over-week trends</div>
+      <div class="sub">Live data from Freshservice · HD Team group only · Pending excluded</div>
+    </div>
+  </div>
+</div>
+
+<div class="page">
+
+  <!-- OVERALL KPIs -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-label">Overall KPIs — Apr through Jun 12</span>
+      <div class="section-rule"></div>
+    </div>
+    <div class="kpi-grid">
+      <div class="kpi-card">
+        <div class="kpi-label">Total tickets</div>
+        <div class="kpi-value">3,307</div>
+        <div class="kpi-sub">3,134 active · 173 pending</div>
+      </div>
+      <div class="kpi-card green">
+        <div class="kpi-label">FCR rate</div>
+        <div class="kpi-value">84.8%</div>
+        <div class="kpi-sub">target 70%</div>
+        <div class="kpi-delta delta-green">✓ +14.8pts above target</div>
+      </div>
+      <div class="kpi-card amber">
+        <div class="kpi-label">SLA compliance</div>
+        <div class="kpi-value">85.6%</div>
+        <div class="kpi-sub">target 90%</div>
+        <div class="kpi-delta delta-amber">⚠ 4.4pts below · improving</div>
+      </div>
+      <div class="kpi-card amber">
+        <div class="kpi-label">Avg response time</div>
+        <div class="kpi-value">87.1h</div>
+        <div class="kpi-sub">3.6 days overall</div>
+        <div class="kpi-delta delta-amber">↓ Improving in Jun</div>
+      </div>
+      <div class="kpi-card amber">
+        <div class="kpi-label">Avg resolution time</div>
+        <div class="kpi-value">189.2h</div>
+        <div class="kpi-sub">7.9 days overall</div>
+        <div class="kpi-delta delta-amber">↓ Improving in Jun</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MONTHLY TABLE -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-label">Monthly breakdown</span>
+      <div class="section-rule"></div>
+    </div>
+    <div class="table-card">
+      <table>
+        <thead>
+          <tr>
+            <th>Month</th>
+            <th class="r">Tickets</th>
+            <th class="r">Resolved</th>
+            <th class="r">Pending</th>
+            <th class="r">FCR</th>
+            <th class="r">SLA overall</th>
+            <th class="r">Avg response</th>
+            <th class="r">Avg resolution</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr class="worst">
+            <td><strong>April 2026</strong></td>
+            <td class="r">1,138</td><td class="r">1,118</td><td class="r">10</td>
+            <td class="r">85.7%</td><td class="r">88.1%</td>
+            <td class="r">103.7h</td><td class="r">204.0h</td>
+            <td><span class="badge badge-blue">Baseline</span></td>
+          </tr>
+          <tr class="worst">
+            <td><strong>May 2026</strong></td>
+            <td class="r">1,504</td><td class="r">1,364</td><td class="r">63</td>
+            <td class="r">81.1%</td><td class="r" style="color:var(--red)">81.0%</td>
+            <td class="r">87.1h</td><td class="r">193.1h</td>
+            <td><span class="badge badge-red">↓ Volume spike</span></td>
+          </tr>
+          <tr class="best">
+            <td><strong>June 2026 ←</strong></td>
+            <td class="r">665</td><td class="r">463</td><td class="r">100</td>
+            <td class="r" style="color:var(--green);font-weight:600">93.5%</td>
+            <td class="r" style="color:var(--green);font-weight:600">92.5%</td>
+            <td class="r" style="color:var(--green);font-weight:600">60.7h</td>
+            <td class="r" style="color:var(--green);font-weight:600">118.5h</td>
+            <td><span class="badge badge-green">↑ Best month</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- WEEKLY TABLE -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-label">June weekly trends</span>
+      <div class="section-rule"></div>
+    </div>
+    <div class="table-card">
+      <table>
+        <thead>
+          <tr>
+            <th>Week</th>
+            <th class="r">Tickets</th>
+            <th class="r">Resolved</th>
+            <th class="r">FCR</th>
+            <th class="r">SLA — FR</th>
+            <th class="r">SLA — Res</th>
+            <th class="r">SLA overall</th>
+            <th class="r">Avg response</th>
+            <th class="r">Avg resolution</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Week 1 · Jun 1–7</strong></td>
+            <td class="r">359</td><td class="r">272</td>
+            <td class="r">91.2%</td><td class="r">87.6%</td>
+            <td class="r">89.6%</td><td class="r">88.6%</td>
+            <td class="r">113.6h</td><td class="r">138.1h</td>
+            <td><span class="badge badge-amber">Below target</span></td>
+          </tr>
+          <tr class="best">
+            <td><strong>Week 2 · Jun 8–14 ←</strong></td>
+            <td class="r">308</td><td class="r">193</td>
+            <td class="r" style="color:var(--green);font-weight:600">96.9%</td>
+            <td class="r" style="color:var(--green);font-weight:600">95.0%</td>
+            <td class="r" style="color:var(--green);font-weight:600">99.2%</td>
+            <td class="r" style="color:var(--green);font-weight:600">97.1%</td>
+            <td class="r" style="color:var(--green);font-weight:600">22.6h</td>
+            <td class="r" style="color:var(--green);font-weight:600">40.7h</td>
+            <td><span class="badge badge-green">✓ All targets met</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="insight">
+      <strong>Week 2 is a significant turnaround.</strong> SLA compliance jumped from 88.6% → 97.1%, average response time dropped from 113.6h → 22.6h (5× faster), and resolution time dropped from 138.1h → 40.7h (3.4× faster). The inflection point is June 8 — Peterson Paret's first full week as Service Desk Manager.
+    </div>
+  </div>
+
+  <!-- DAILY CHARTS -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-label">Daily trends — Jun 1 through Jun 12</span>
+      <div class="section-rule"></div>
+    </div>
+
+    <div class="legend">
+      <div class="legend-item"><div class="legend-swatch" style="background:#2B5CE6"></div> Weekdays</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:#C8C5BC"></div> Weekend (low volume)</div>
+      <div class="legend-item"><div class="legend-line" style="background:#B03A2E"></div> 90% SLA target</div>
+    </div>
+
+    <div class="chart-card-full" style="margin-bottom:16px">
+      <div class="chart-label">SLA first response rate (%)</div>
+      <div class="chart-wrap" style="height:200px">
+        <canvas id="slaChart" role="img" aria-label="Daily SLA first response rate June 1 to 12. Ranges from 82.8% on June 2 to 97.6% on June 11 with clear upward trend after June 8.">Daily SLA first response: Week 1 avg ~87%, Week 2 avg ~95%.</canvas>
+      </div>
+    </div>
+
+    <div class="chart-grid-3">
+      <div class="chart-card">
+        <div class="chart-label">Avg response time (hours)</div>
+        <div class="chart-wrap" style="height:190px">
+          <canvas id="frtChart" role="img" aria-label="Average response time per day. Week 1: 105 to 125 hours. Week 2: 8 to 29 hours.">Response time drops from 100+ hours to under 30 hours in week 2.</canvas>
+        </div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-label">Avg resolution time (hours)</div>
+        <div class="chart-wrap" style="height:190px">
+          <canvas id="ttrChart" role="img" aria-label="Average resolution time per day. Week 1: 120 to 145 hours. Week 2: 19 to 68 hours.">Resolution time drops from 130+ hours to under 70 hours in week 2.</canvas>
+        </div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-label">Daily ticket volume (active)</div>
+        <div class="chart-wrap" style="height:190px">
+          <canvas id="volChart" role="img" aria-label="Daily ticket volume June 1 to 12. Weekdays range 36 to 99 tickets. Weekends 2 to 3 tickets.">Daily volume: weekdays 36-99, weekends 2-3.</canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TICKET VOLUME BY MONTH -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-label">Ticket volume by month — still open today</span>
+      <div class="section-rule"></div>
+    </div>
+    <div class="kpi-grid-4">
+      <div class="kpi-card green">
+        <div class="kpi-label">March 2026</div>
+        <div class="kpi-value">790</div>
+        <div class="kpi-sub">opened</div>
+        <div class="kpi-delta delta-green">3 still open · 99.6% resolved</div>
+      </div>
+      <div class="kpi-card green">
+        <div class="kpi-label">April 2026</div>
+        <div class="kpi-value">1,617</div>
+        <div class="kpi-sub">opened</div>
+        <div class="kpi-delta delta-green">53 still open · 96.7% resolved</div>
+      </div>
+      <div class="kpi-card amber">
+        <div class="kpi-label">May 2026</div>
+        <div class="kpi-value">1,680</div>
+        <div class="kpi-sub">opened</div>
+        <div class="kpi-delta delta-amber">524 still open · 68.8% resolved</div>
+      </div>
+      <div class="kpi-card blue">
+        <div class="kpi-label">June 2026 ← now</div>
+        <div class="kpi-value">665</div>
+        <div class="kpi-sub">opened so far</div>
+        <div class="kpi-delta delta-blue" style="background:var(--blue-bg);color:var(--blue);border:1px solid #B6CCE8">213 open · month in progress</div>
+      </div>
+    </div>
+  </div>
+
+  <hr>
+
+  <!-- FOOTER -->
+  <div class="footer">
+    <span>PGIS IT Operations · Help Desk Team (group 17000367080) · Pending tickets excluded throughout</span>
+    <span>Generated Jun 12, 2026 · Data: Freshservice API</span>
+  </div>
+
+</div>
+
+<script>
+const labels = ['Jun 1','Jun 2','Jun 3','Jun 4','Jun 5','Jun 6','Jun 7','Jun 8','Jun 9','Jun 10','Jun 11','Jun 12'];
+const isWeekend = [false,false,false,false,false,true,true,false,false,false,false,false];
+const blue = '#2B5CE6', gray = '#C8C5BC', red = '#B03A2E';
+const barColors = isWeekend.map(w => w ? gray : blue);
+
+const slaData = [88.9,82.8,85.9,91.7,88.9,100,100,91.2,94.1,97.1,97.6,95.0];
+const frtData = [105.7,119.3,113.1,119.3,124.9,37.6,22.5,28.4,18.9,8.5,12.3,15.1];
+const ttrData = [145.8,143.7,138.8,129.9,121.4,22.2,null,68.2,54.1,19.3,28.7,35.2];
+const volData = [90,64,64,48,36,2,2,68,62,58,54,47];
+
+const baseOpts = (yMin, yMax, suffix) => ({
+  responsive: true, maintainAspectRatio: false,
+  plugins: { legend:{display:false}, tooltip:{callbacks:{label:i=>i.raw!==null?` ${i.raw}${suffix}`:' no data'}} },
+  scales: {
+    x: { ticks:{color:'#9B9890',font:{size:10},autoSkip:false,maxRotation:45}, grid:{display:false} },
+    y: { min:yMin, max:yMax, ticks:{color:'#9B9890',font:{size:10},callback:v=>v+suffix}, grid:{color:'rgba(0,0,0,0.06)'} }
+  }
+});
+
+new Chart(document.getElementById('slaChart'), {
+  type:'bar',
+  data:{ labels, datasets:[
+    {label:'SLA FR%', data:slaData, backgroundColor:barColors, borderRadius:3, barPercentage:.65},
+    {label:'90% target', data:labels.map(()=>90), type:'line', borderColor:red, borderWidth:1.5, borderDash:[5,3], pointRadius:0, fill:false}
+  ]},
+  options: baseOpts(70, 105, '%')
+});
+
+new Chart(document.getElementById('frtChart'), {
+  type:'bar',
+  data:{ labels, datasets:[{label:'Avg response (h)', data:frtData, backgroundColor:barColors, borderRadius:3, barPercentage:.65}]},
+  options: baseOpts(0, 140, 'h')
+});
+
+new Chart(document.getElementById('ttrChart'), {
+  type:'bar',
+  data:{ labels, datasets:[{label:'Avg resolution (h)', data:ttrData, backgroundColor:barColors, borderRadius:3, barPercentage:.65}]},
+  options: baseOpts(0, 165, 'h')
+});
+
+new Chart(document.getElementById('volChart'), {
+  type:'bar',
+  data:{ labels, datasets:[{label:'Tickets', data:volData, backgroundColor:barColors, borderRadius:3, barPercentage:.65}]},
+  options: baseOpts(0, 110, '')
+});
+</script>
+</body>
+</html>

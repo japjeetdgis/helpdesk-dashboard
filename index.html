@@ -83,7 +83,7 @@
       <h1>Help Desk <span>Performance</span> Dashboard</h1>
     </div>
     <div>
-      <div class="auto-badge">⚡ Auto-updated · Jun 16, 2026, 12:43 PM ET</div>
+      <div class="auto-badge">⚡ Auto-updated · Jun 17, 2026, 07:05 AM ET</div>
       <div class="header-sub">Freshservice · HD Team · All statuses incl. pending · Runs nightly</div>
     </div>
   </div>
@@ -209,22 +209,22 @@
   <hr>
   <div class="footer">
     <span>PGIS IT Operations · HD Team (17000367080) · All statuses · Auto-updated nightly</span>
-    <span>japjeetdgis.github.io/helpdesk-dashboard · Jun 16, 2026, 12:43 PM ET</span>
+    <span>japjeetdgis.github.io/helpdesk-dashboard · Jun 17, 2026, 07:05 AM ET</span>
   </div>
 </div>
 
 <script>
 const wkLabels=[], wkBg=[];
-const dayLabels=["Jun 1","Jun 2","Jun 3","Jun 4","Jun 5","Jun 6","Jun 7","Jun 8","Jun 9","Jun 10","Jun 11","Jun 12","Jun 13","Jun 14","Jun 15","Jun 16"], dayColors=["#2B5CE6","#2B5CE6","#2B5CE6","#2B5CE6","#2B5CE6","#C8C5BC","#C8C5BC","#2B5CE6","#2B5CE6","#2B5CE6","#2B5CE6","#2B5CE6","#C8C5BC","#C8C5BC","#2B5CE6","#2B5CE6"];
+const dayLabels=["Jun 1","Jun 2","Jun 3","Jun 4","Jun 5","Jun 6","Jun 7","Jun 8","Jun 9","Jun 10","Jun 11","Jun 12","Jun 13","Jun 14","Jun 15","Jun 16","Jun 17"], dayColors=["#2B5CE6","#2B5CE6","#2B5CE6","#2B5CE6","#2B5CE6","#C8C5BC","#C8C5BC","#2B5CE6","#2B5CE6","#2B5CE6","#2B5CE6","#2B5CE6","#C8C5BC","#C8C5BC","#2B5CE6","#2B5CE6","#2B5CE6"];
 const mkOpts=(yMin,yMax,suffix)=>({responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:i=>i.raw!==null?' '+i.raw+suffix:' no data'}}},scales:{x:{ticks:{color:'#9B9890',font:{size:10},autoSkip:false,maxRotation:45},grid:{display:false}},y:{min:yMin,max:yMax,ticks:{color:'#9B9890',font:{size:10},callback:v=>v+suffix},grid:{color:'rgba(0,0,0,0.05)'}}}});
 new Chart(document.getElementById('wk_vol'),{type:'bar',data:{labels:wkLabels,datasets:[{data:[],backgroundColor:wkBg,borderRadius:4,barPercentage:.5}]},options:mkOpts(0,null,'')});
 new Chart(document.getElementById('wk_frt'),{type:'bar',data:{labels:wkLabels,datasets:[{data:[],backgroundColor:wkBg,borderRadius:4,barPercentage:.5}]},options:mkOpts(0,null,'h')});
 new Chart(document.getElementById('wk_ttr'),{type:'bar',data:{labels:wkLabels,datasets:[{data:[],backgroundColor:wkBg,borderRadius:4,barPercentage:.5}]},options:mkOpts(0,null,'h')});
 new Chart(document.getElementById('wk_fr2r'),{type:'bar',data:{labels:wkLabels,datasets:[{data:[],backgroundColor:wkBg,borderRadius:4,barPercentage:.5}]},options:mkOpts(0,null,'h')});
-new Chart(document.getElementById('slaChart'),{type:'bar',data:{labels:dayLabels,datasets:[{data:[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],backgroundColor:dayColors,borderRadius:3,barPercentage:.65},{data:dayLabels.map(()=>90),type:'line',borderColor:'#B03A2E',borderWidth:1.5,borderDash:[5,3],pointRadius:0,fill:false}]},options:mkOpts(70,105,'%')});
-new Chart(document.getElementById('frtChart'),{type:'bar',data:{labels:dayLabels,datasets:[{data:[null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null],backgroundColor:dayColors,borderRadius:3,barPercentage:.65}]},options:mkOpts(0,null,'h')});
-new Chart(document.getElementById('ttrChart'),{type:'bar',data:{labels:dayLabels,datasets:[{data:[null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null],backgroundColor:dayColors,borderRadius:3,barPercentage:.65}]},options:mkOpts(0,null,'h')});
-new Chart(document.getElementById('volChart'),{type:'bar',data:{labels:dayLabels,datasets:[{data:[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],backgroundColor:dayColors,borderRadius:3,barPercentage:.65}]},options:mkOpts(0,null,'')});
+new Chart(document.getElementById('slaChart'),{type:'bar',data:{labels:dayLabels,datasets:[{data:[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],backgroundColor:dayColors,borderRadius:3,barPercentage:.65},{data:dayLabels.map(()=>90),type:'line',borderColor:'#B03A2E',borderWidth:1.5,borderDash:[5,3],pointRadius:0,fill:false}]},options:mkOpts(70,105,'%')});
+new Chart(document.getElementById('frtChart'),{type:'bar',data:{labels:dayLabels,datasets:[{data:[null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null],backgroundColor:dayColors,borderRadius:3,barPercentage:.65}]},options:mkOpts(0,null,'h')});
+new Chart(document.getElementById('ttrChart'),{type:'bar',data:{labels:dayLabels,datasets:[{data:[null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null],backgroundColor:dayColors,borderRadius:3,barPercentage:.65}]},options:mkOpts(0,null,'h')});
+new Chart(document.getElementById('volChart'),{type:'bar',data:{labels:dayLabels,datasets:[{data:[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],backgroundColor:dayColors,borderRadius:3,barPercentage:.65}]},options:mkOpts(0,null,'')});
 </script>
 </body>
 </html>

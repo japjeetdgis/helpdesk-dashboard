@@ -6,7 +6,7 @@ const DOMAIN = process.env.FRESHSERVICE_DOMAIN || 'support.patriotgis.com';
 const HD_GROUP = 17000367080;
 const MAR_CUTOFF = new Date('2026-03-01T00:00:00Z');
 const auth = { username: API_KEY, password: 'X' };
-const baseURL = `https://${DOMAIN}/api/v2`;
+const baseURL = `https://${DOMAIN}/api/_`;
 const avg = arr => arr.length ? arr.reduce((a,b)=>a+b,0)/arr.length : null;
 const fmt = h => h === null || h === undefined ? 'n/a' : h < 24 ? h.toFixed(1)+'h' : (h/24).toFixed(1)+'d';
 

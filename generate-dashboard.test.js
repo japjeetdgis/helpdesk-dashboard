@@ -1,6 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { fetchAllTickets, calcStats, buildHTML } = require('./generate-dashboard.js');
+const { fetchAllTickets, calcStats, buildHTML, getDays, getWeeks, listMonths } = require('./generate-dashboard.js');
 
 const HD_GROUP = 17000367080;
 const noSleep = () => Promise.resolve();
@@ -132,6 +132,8 @@ test('F2. calcStats handles an empty set without dividing by zero', () => {
 test('G. buildHTML renders a page from empty data without throwing', () => {
   const html = buildHTML({
     monthly: { 'Jun 2026': calcStats([]) },
+    months: [{ key: 'Jun 2026', long: 'June 2026', isCurrent: true }],
+    current: { key: 'Jun 2026', long: 'June 2026' },
     weekly: [],
     days: [],
     overall: calcStats([]),
@@ -146,10 +148,64 @@ test('G2. buildHTML renders a populated week', () => {
   const week = { label: 'Wk 1', shortLabel: 'Jun 1–7', total: 5, pending: 1, avgFRT: 2, avgTTR: 10, overSLA: 80, frSLA: 80, frtToRes: 8 };
   const html = buildHTML({
     monthly: { 'Jun 2026': calcStats([]) },
+    months: [{ key: 'Jun 2026', long: 'June 2026', isCurrent: true }],
+    current: { key: 'Jun 2026', long: 'June 2026' },
     weekly: [week],
     days: [],
     overall: calcStats([]),
     updated: 'x',
   });
   assert.match(html, /Jun 1–7/);
+});
+
+// --- date-window rollover (PR2): derive the window from "now" ----------------
+
+const dayTicket = (created_at) => ({ created_at, status: 2, fr_escalated: false, is_escalated: false, updated_at: created_at });
+
+test('H. listMonths spans data-start (Mar 2026) through the current month', () => {
+  const keys = listMonths(new Date('2026-03-01T00:00:00Z'), new Date('2026-06-18T12:00:00Z')).map(m => m.key);
+  assert.deepEqual(keys, ['Mar 2026', 'Apr 2026', 'May 2026', 'Jun 2026']);
+});
+
+test('H2. listMonths rolls forward into July', () => {
+  const months = listMonths(new Date('2026-03-01T00:00:00Z'), new Date('2026-07-15T12:00:00Z'));
+  assert.deepEqual(months.map(m => m.key), ['Mar 2026', 'Apr 2026', 'May 2026', 'Jun 2026', 'Jul 2026']);
+  assert.equal(months.at(-1).long, 'July 2026');
+  assert.equal(months.at(-1).isCurrent, true);
+  assert.equal(months[0].isCurrent, false);
+});
+
+test('H3. listMonths handles the year rollover', () => {
+  const keys = listMonths(new Date('2026-03-01T00:00:00Z'), new Date('2027-01-10T12:00:00Z')).map(m => m.key);
+  assert.equal(keys[0], 'Mar 2026');
+  assert.equal(keys.at(-1), 'Jan 2027');
+});
+
+test('I. getDays labels the actual current month, not a hardcoded June', () => {
+  const days = getDays([dayTicket('2026-07-03T10:00:00Z')], new Date('2026-07-05T12:00:00Z'));
+  assert.equal(days.length, 5);            // Jul 1..5
+  assert.equal(days[0].label, 'Jul 1');
+  assert.ok(days.every(d => !d.label.includes('Jun')), 'no June labels in July');
+});
+
+test('J. getWeeks labels the actual current month', () => {
+  const weeks = getWeeks([dayTicket('2026-07-09T10:00:00Z')], new Date('2026-07-15T12:00:00Z'));
+  assert.ok(weeks.length >= 1);
+  assert.ok(weeks.some(w => w.shortLabel.includes('Jul')), 'a week should be labeled Jul');
+  assert.ok(weeks.every(w => !w.shortLabel.includes('Jun')));
+});
+
+test('K. buildHTML renders the current month and full history dynamically', () => {
+  const monthly = { 'Mar 2026': calcStats([]), 'Jul 2026': calcStats([]) };
+  const months = [
+    { key: 'Mar 2026', long: 'March 2026', isCurrent: false },
+    { key: 'Jul 2026', long: 'July 2026', isCurrent: true },
+  ];
+  const html = buildHTML({
+    monthly, months, current: { key: 'Jul 2026', long: 'July 2026' },
+    weekly: [], days: [], overall: calcStats([]), updated: 'Jul 5, 2026, 12:00 PM ET',
+  });
+  assert.match(html, /Current month — July 2026/);
+  assert.match(html, /March 2026/);
+  assert.doesNotMatch(html, /Current month — June 2026/);
 });

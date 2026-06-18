@@ -6,16 +6,40 @@ const DOMAIN = process.env.FRESHSERVICE_DOMAIN || 'support.patriotgis.com';
 const HD_GROUP = 17000367080;
 const MAR_CUTOFF = new Date('2026-03-01T00:00:00Z');
 const auth = { username: API_KEY, password: 'X' };
-const baseURL = `https://${DOMAIN}/api/_`;
+const baseURL = `https://${DOMAIN}/api/v2`;
 const avg = arr => arr.length ? arr.reduce((a,b)=>a+b,0)/arr.length : null;
 const fmt = h => h === null || h === undefined ? 'n/a' : h < 24 ? h.toFixed(1)+'h' : (h/24).toFixed(1)+'d';
+const realSleep = ms => new Promise(r => setTimeout(r, ms));
 
-async function fetchAllTickets() {
+const RETRYABLE_STATUS = new Set([404, 408, 429, 500, 502, 503, 504]);
+// Transient = a network error (no response) or a retryable status. 401 and 403
+// are excluded on purpose: they mean bad auth / wrong endpoint and won't self-heal.
+const isRetryable = e => e.response ? RETRYABLE_STATUS.has(e.response.status) : true;
+
+async function withRetry(fn, { sleep, maxRetries, label }) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const status = e.response?.status;
+      if (!isRetryable(e) || attempt >= maxRetries) throw e;
+      const waitMs = status === 429 ? 30000 : 1000 * 2 ** attempt;
+      console.log(`  Request failed (HTTP ${status ?? e.code ?? e.message}) — retry ${attempt + 1}/${maxRetries} in ${waitMs}ms [${label}]`);
+      await sleep(waitMs);
+    }
+  }
+}
+
+async function fetchAllTickets(opts = {}) {
+  const { client = axios, sleep = realSleep, maxPages = 150, maxRetries = 3 } = opts;
   console.log(`Fetching tickets — domain: ${DOMAIN}, API key set: ${!!API_KEY} (${API_KEY?.length} chars)`);
 
   // Test connectivity first
   try {
-    const test = await axios.get(`${baseURL}/tickets`, { auth, params: { per_page: 1, page: 1 } });
+    const test = await withRetry(
+      () => client.get(`${baseURL}/tickets`, { auth, params: { per_page: 1, page: 1 } }),
+      { sleep, maxRetries, label: 'connectivity' }
+    );
     console.log(`API connectivity OK — HTTP ${test.status}`);
   } catch(e) {
     const status = e.response?.status;
@@ -25,34 +49,33 @@ async function fetchAllTickets() {
   }
 
   let all = [], page = 1;
-  while (page <= 150) {
+  while (page <= maxPages) {
+    let res;
     try {
-      const res = await axios.get(`${baseURL}/tickets`, {
-        auth,
-        params: { per_page: 100, page, order_by: 'created_at', order_type: 'desc', updated_since: '2026-03-01T00:00:00Z' }
-      });
-      const tickets = res.data.tickets || [];
-      console.log(`  Page ${page}: ${tickets.length} tickets returned | HD so far: ${all.length}`);
-      if (!tickets.length) break;
-
-      let hitCutoff = false;
-      for (const t of tickets) {
-        if (new Date(t.created_at) < MAR_CUTOFF) { hitCutoff = true; break; }
-        if (t.group_id === HD_GROUP) all.push(t);
-      }
-      if (hitCutoff) break;
-      if (tickets.length < 100) break;
-      page++;
-      await new Promise(r => setTimeout(r, 150));
+      res = await withRetry(
+        () => client.get(`${baseURL}/tickets`, {
+          auth,
+          params: { per_page: 100, page, order_by: 'created_at', order_type: 'desc', updated_since: '2026-03-01T00:00:00Z' }
+        }),
+        { sleep, maxRetries, label: `page ${page}` }
+      );
     } catch(e) {
-      if (e.response?.status === 429) {
-        console.log('  Rate limited — waiting 30s...');
-        await new Promise(r => setTimeout(r, 30000));
-        continue;
-      }
-      console.error(`  Error page ${page}: ${e.response?.status} ${e.message}`);
+      console.error(`  Error page ${page} (gave up after ${maxRetries} retries): ${e.response?.status} ${e.message}`);
       break;
     }
+    const tickets = res.data.tickets || [];
+    console.log(`  Page ${page}: ${tickets.length} tickets returned | HD so far: ${all.length}`);
+    if (!tickets.length) break;
+
+    let hitCutoff = false;
+    for (const t of tickets) {
+      if (new Date(t.created_at) < MAR_CUTOFF) { hitCutoff = true; break; }
+      if (t.group_id === HD_GROUP) all.push(t);
+    }
+    if (hitCutoff) break;
+    if (tickets.length < 100) break;
+    page++;
+    await sleep(150);
   }
 
   console.log(`Fetch complete — ${all.length} HD tickets, ${page} pages`);
@@ -332,4 +355,8 @@ async function main() {
   console.log(`Dashboard written — ${html.length} chars, ${all.length} tickets processed`);
 }
 
-main().catch(err=>{console.error('FATAL:',err.message);process.exit(1);});
+if (require.main === module) {
+  main().catch(err=>{console.error('FATAL:',err.message);process.exit(1);});
+}
+
+module.exports = { fetchAllTickets, calcStats, getWeeks, getDays, buildHTML, main };

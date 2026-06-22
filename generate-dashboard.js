@@ -11,6 +11,22 @@ const avg = arr => arr.length ? arr.reduce((a,b)=>a+b,0)/arr.length : null;
 const fmt = h => h === null || h === undefined ? 'n/a' : h < 24 ? h.toFixed(1)+'h' : (h/24).toFixed(1)+'d';
 const realSleep = ms => new Promise(r => setTimeout(r, ms));
 
+const monthKey  = d => d.toLocaleString('en-US', { month: 'short', year: 'numeric', timeZone: 'UTC' }); // "Jun 2026"
+const monthLong = d => d.toLocaleString('en-US', { month: 'long',  year: 'numeric', timeZone: 'UTC' }); // "June 2026"
+
+// Every month from the data-start month through the month containing `now`, inclusive.
+function listMonths(startDate, now) {
+  const months = [];
+  let y = startDate.getUTCFullYear(), m = startDate.getUTCMonth();
+  const endY = now.getUTCFullYear(), endM = now.getUTCMonth();
+  while (y < endY || (y === endY && m <= endM)) {
+    const d = new Date(Date.UTC(y, m, 1));
+    months.push({ key: monthKey(d), long: monthLong(d), year: y, monthIndex: m, isCurrent: y === endY && m === endM });
+    if (++m > 11) { m = 0; y++; }
+  }
+  return months;
+}
+
 const RETRYABLE_STATUS = new Set([404, 408, 429, 500, 502, 503, 504]);
 // Transient = a network error (no response) or a retryable status. 401 and 403
 // are excluded on purpose: they mean bad auth / wrong endpoint and won't self-heal.
@@ -104,40 +120,42 @@ function calcStats(tickets) {
   };
 }
 
-function getWeeks(junTickets) {
-  const now = new Date();
+function getWeeks(monthTickets, now) {
   const weeks = [];
-  let weekStart = new Date('2026-06-01');
+  const monShort = monthKey(now).split(' ')[0];
+  const lastDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth()+1, 0)).getUTCDate();
+  const weekStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
   while (weekStart <= now) {
     const weekEnd = new Date(weekStart);
-    weekEnd.setDate(weekEnd.getDate()+6);
-    weekEnd.setHours(23,59,59);
-    const wt = junTickets.filter(t=>new Date(t.created_at)>=weekStart&&new Date(t.created_at)<=weekEnd);
+    weekEnd.setUTCDate(weekEnd.getUTCDate()+6);
+    weekEnd.setUTCHours(23,59,59,999);
+    const wt = monthTickets.filter(t=>{const c=new Date(t.created_at);return c>=weekStart&&c<=weekEnd;});
     if (wt.length>0) {
-      const endDay = Math.min(weekEnd.getDate(), new Date(weekStart.getFullYear(),weekStart.getMonth()+1,0).getDate());
-      weeks.push({ label:`Wk ${weeks.length+1}\nJun ${weekStart.getDate()}–${endDay}`, shortLabel:`Jun ${weekStart.getDate()}–${endDay}`, ...calcStats(wt) });
+      const startDay = weekStart.getUTCDate();
+      const endDay = Math.min(startDay+6, lastDay);
+      weeks.push({ label:`Wk ${weeks.length+1}\n${monShort} ${startDay}–${endDay}`, shortLabel:`${monShort} ${startDay}–${endDay}`, ...calcStats(wt) });
     }
-    weekStart.setDate(weekStart.getDate()+7);
+    weekStart.setUTCDate(weekStart.getUTCDate()+7);
   }
   return weeks;
 }
 
-function getDays(junTickets) {
-  const now = new Date();
+function getDays(monthTickets, now) {
   const days = [];
-  const d = new Date('2026-06-01');
+  const monShort = monthKey(now).split(' ')[0];
+  const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
   while (d<=now) {
     const ds = d.toISOString().substring(0,10);
-    const dt = junTickets.filter(t=>t.created_at?.substring(0,10)===ds);
-    days.push({ label:`Jun ${d.getDate()}`, isWeekend:[0,6].includes(d.getDay()), ...calcStats(dt) });
-    d.setDate(d.getDate()+1);
+    const dt = monthTickets.filter(t=>t.created_at?.substring(0,10)===ds);
+    days.push({ label:`${monShort} ${d.getUTCDate()}`, isWeekend:[0,6].includes(d.getUTCDay()), ...calcStats(dt) });
+    d.setUTCDate(d.getUTCDate()+1);
   }
   return days;
 }
 
 function buildHTML(data) {
-  const { monthly, weekly, days, overall, updated } = data;
-  const jun = monthly['Jun 2026'] || {};
+  const { monthly, weekly, days, overall, updated, months, current } = data;
+  const cur = monthly[current.key] || {};
   const wkColors = ['#2B5CE6','#1A7A52','#9B5DE5','#F15BB5','#00BBF9'];
   const wkLabels = JSON.stringify(weekly.map(w=>w.label));
   const wkVol    = JSON.stringify(weekly.map(w=>w.total));
@@ -224,17 +242,17 @@ hr{border:none;border-top:1px solid var(--border);margin:32px 0}
 
 <div class="page">
 <div class="section">
-  <div class="section-header"><span class="section-label">Current month — June 2026</span><div class="section-rule"></div></div>
+  <div class="section-header"><span class="section-label">Current month — ${current.long}</span><div class="section-rule"></div></div>
   <div class="month-banner"><div class="month-banner-inner">
     <div>
-      <div class="mb-eyebrow">June 2026 · All statuses including pending · Auto-updated nightly</div>
+      <div class="mb-eyebrow">${current.long} · All statuses including pending · Auto-updated nightly</div>
       <div class="mb-heading">Strong improvement — team gaining momentum week over week</div>
       <div class="mb-kpis">
-        <div><div class="mb-kpi-label">Tickets</div><div class="mb-kpi-value">${jun.total||0}</div><div class="mb-kpi-sub">month to date</div></div>
-        <div><div class="mb-kpi-label">FCR rate</div><div class="mb-kpi-value">${jun.fcr||0}%</div><div class="mb-kpi-sub">target 70% ✓</div></div>
-        <div><div class="mb-kpi-label">SLA</div><div class="mb-kpi-value">${jun.overSLA||0}%</div><div class="mb-kpi-sub">target 90%</div></div>
-        <div><div class="mb-kpi-label">Avg response</div><div class="mb-kpi-value">${fmt(jun.avgFRT)}</div><div class="mb-kpi-sub">this month</div></div>
-        <div><div class="mb-kpi-label">Avg resolution</div><div class="mb-kpi-value">${fmt(jun.avgTTR)}</div><div class="mb-kpi-sub">this month</div></div>
+        <div><div class="mb-kpi-label">Tickets</div><div class="mb-kpi-value">${cur.total||0}</div><div class="mb-kpi-sub">month to date</div></div>
+        <div><div class="mb-kpi-label">FCR rate</div><div class="mb-kpi-value">${cur.fcr||0}%</div><div class="mb-kpi-sub">target 70% ✓</div></div>
+        <div><div class="mb-kpi-label">SLA</div><div class="mb-kpi-value">${cur.overSLA||0}%</div><div class="mb-kpi-sub">target 90%</div></div>
+        <div><div class="mb-kpi-label">Avg response</div><div class="mb-kpi-value">${fmt(cur.avgFRT)}</div><div class="mb-kpi-sub">this month</div></div>
+        <div><div class="mb-kpi-label">Avg resolution</div><div class="mb-kpi-value">${fmt(cur.avgTTR)}</div><div class="mb-kpi-sub">this month</div></div>
       </div>
     </div>
     <div class="wk-grid">
@@ -280,16 +298,19 @@ hr{border:none;border-top:1px solid var(--border);margin:32px 0}
   <div class="table-card"><table>
     <thead><tr><th>Month</th><th class="r">Total</th><th class="r">Resolved</th><th class="r">Pending</th><th class="r">Still open</th><th class="r">FCR</th><th class="r">SLA</th><th class="r">Avg response</th><th class="r">Avg resolution</th><th>Status</th></tr></thead>
     <tbody>
-      <tr><td><strong>March 2026</strong></td><td class="r">${mo('Mar 2026','total')}</td><td class="r">${mo('Mar 2026','resolved')}</td><td class="r">${mo('Mar 2026','pending')}</td><td class="r">${mo('Mar 2026','stillOpen')}</td><td class="r">${mo('Mar 2026','fcr')}%</td><td class="r">${mo('Mar 2026','overSLA')}%</td><td class="r">${fmt(monthly['Mar 2026']?.avgFRT)}</td><td class="r">${fmt(monthly['Mar 2026']?.avgTTR)}</td><td><span class="badge bg">✓ Done</span></td></tr>
-      <tr class="warn"><td><strong>April 2026</strong></td><td class="r">${mo('Apr 2026','total')}</td><td class="r">${mo('Apr 2026','resolved')}</td><td class="r">${mo('Apr 2026','pending')}</td><td class="r">${mo('Apr 2026','stillOpen')}</td><td class="r">${mo('Apr 2026','fcr')}%</td><td class="r">${mo('Apr 2026','overSLA')}%</td><td class="r">${fmt(monthly['Apr 2026']?.avgFRT)}</td><td class="r">${fmt(monthly['Apr 2026']?.avgTTR)}</td><td><span class="badge bb">Baseline</span></td></tr>
-      <tr class="warn"><td><strong>May 2026</strong></td><td class="r">${mo('May 2026','total')}</td><td class="r">${mo('May 2026','resolved')}</td><td class="r">${mo('May 2026','pending')}</td><td class="r" style="color:#B03A2E;font-weight:600">${mo('May 2026','stillOpen')}</td><td class="r">${mo('May 2026','fcr')}%</td><td class="r" style="color:#B03A2E">${mo('May 2026','overSLA')}%</td><td class="r">${fmt(monthly['May 2026']?.avgFRT)}</td><td class="r">${fmt(monthly['May 2026']?.avgTTR)}</td><td><span class="badge br">↓ Volume spike</span></td></tr>
-      <tr class="best"><td><strong>June 2026 ←</strong></td><td class="r">${mo('Jun 2026','total')}</td><td class="r">${mo('Jun 2026','resolved')}</td><td class="r">${mo('Jun 2026','pending')}</td><td class="r">${mo('Jun 2026','stillOpen')}</td><td class="r" style="color:#1A7A52;font-weight:600">${mo('Jun 2026','fcr')}%</td><td class="r" style="color:#1A7A52;font-weight:600">${mo('Jun 2026','overSLA')}%</td><td class="r" style="color:#1A7A52;font-weight:600">${fmt(monthly['Jun 2026']?.avgFRT)}</td><td class="r" style="color:#1A7A52;font-weight:600">${fmt(monthly['Jun 2026']?.avgTTR)}</td><td><span class="badge bg">↑ Best month</span></td></tr>
+      ${months.map(m=>{
+        const isCur=m.isCurrent;
+        const name=isCur?`${m.long} ←`:m.long;
+        const hl=isCur?' style="color:#1A7A52;font-weight:600"':'';
+        const badge=isCur?'<span class="badge bb">In progress</span>':'<span class="badge bg">✓ Complete</span>';
+        return `<tr${isCur?' class="best"':''}><td><strong>${name}</strong></td><td class="r">${mo(m.key,'total')}</td><td class="r">${mo(m.key,'resolved')}</td><td class="r">${mo(m.key,'pending')}</td><td class="r">${mo(m.key,'stillOpen')}</td><td class="r"${hl}>${mo(m.key,'fcr')}%</td><td class="r"${hl}>${mo(m.key,'overSLA')}%</td><td class="r"${hl}>${fmt(monthly[m.key]?.avgFRT)}</td><td class="r"${hl}>${fmt(monthly[m.key]?.avgTTR)}</td><td>${badge}</td></tr>`;
+      }).join('')}
     </tbody>
   </table></div>
 </div>
 
 <div class="section">
-  <div class="section-header"><span class="section-label">Daily trends — June 2026</span><div class="section-rule"></div></div>
+  <div class="section-header"><span class="section-label">Daily trends — ${current.long}</span><div class="section-rule"></div></div>
   <div class="legend">
     <div class="li"><div class="sw" style="background:#2B5CE6"></div>Weekdays</div>
     <div class="li"><div class="sw" style="background:#C8C5BC"></div>Weekend</div>
@@ -307,10 +328,13 @@ hr{border:none;border-top:1px solid var(--border);margin:32px 0}
 <div class="section">
   <div class="section-header"><span class="section-label">Ticket volume — still open or pending today</span><div class="section-rule"></div></div>
   <div class="kpi-grid-4">
-    <div class="kpi-card green"><div class="kpi-label">March 2026</div><div class="kpi-value">${mo('Mar 2026','total')}</div><div class="kpi-sub">tickets created</div><div class="kpi-delta dg">${mo('Mar 2026','stillOpen')} still open</div></div>
-    <div class="kpi-card green"><div class="kpi-label">April 2026</div><div class="kpi-value">${mo('Apr 2026','total')}</div><div class="kpi-sub">tickets created</div><div class="kpi-delta dg">${mo('Apr 2026','stillOpen')} still open</div></div>
-    <div class="kpi-card amber"><div class="kpi-label">May 2026</div><div class="kpi-value">${mo('May 2026','total')}</div><div class="kpi-sub">tickets created</div><div class="kpi-delta da">${mo('May 2026','stillOpen')} still open</div></div>
-    <div class="kpi-card blue"><div class="kpi-label">June 2026 ← now</div><div class="kpi-value">${mo('Jun 2026','total')}</div><div class="kpi-sub">created so far</div><div class="kpi-delta db">${mo('Jun 2026','stillOpen')} open · in progress</div></div>
+    ${months.slice(-4).map(m=>{
+      const isCur=m.isCurrent;
+      const name=isCur?`${m.long} ← now`:m.long;
+      const sub=isCur?'created so far':'tickets created';
+      const delta=isCur?`${mo(m.key,'stillOpen')} open · in progress`:`${mo(m.key,'stillOpen')} still open`;
+      return `<div class="kpi-card ${isCur?'blue':'green'}"><div class="kpi-label">${name}</div><div class="kpi-value">${mo(m.key,'total')}</div><div class="kpi-sub">${sub}</div><div class="kpi-delta ${isCur?'db':'dg'}">${delta}</div></div>`;
+    }).join('')}
   </div>
 </div>
 
@@ -338,19 +362,19 @@ new Chart(document.getElementById('volChart'),{type:'bar',data:{labels:dayLabels
 
 async function main() {
   const all = await fetchAllTickets();
-  const getMonth = (mo,yr) => all.filter(t=>{const d=new Date(t.created_at);return d.getFullYear()===yr&&d.getMonth()===mo;});
-  const monthly = {
-    'Mar 2026': calcStats(getMonth(2,2026)),
-    'Apr 2026': calcStats(getMonth(3,2026)),
-    'May 2026': calcStats(getMonth(4,2026)),
-    'Jun 2026': calcStats(getMonth(5,2026)),
-  };
-  const junTickets = all.filter(t=>new Date(t.created_at)>=new Date('2026-06-01'));
-  const weekly = getWeeks(junTickets);
-  const days = getDays(junTickets);
+  const now = new Date();
+  const getMonth = (mo,yr) => all.filter(t=>{const d=new Date(t.created_at);return d.getUTCFullYear()===yr&&d.getUTCMonth()===mo;});
+  const months = listMonths(MAR_CUTOFF, now);
+  const monthly = {};
+  for (const m of months) monthly[m.key] = calcStats(getMonth(m.monthIndex, m.year));
+  const current = months.find(m=>m.isCurrent) || months.at(-1);
+  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  const monthTickets = all.filter(t=>new Date(t.created_at)>=monthStart);
+  const weekly = getWeeks(monthTickets, now);
+  const days = getDays(monthTickets, now);
   const overall = calcStats(all);
-  const updated = new Date().toLocaleString('en-US',{timeZone:'America/New_York',month:'short',day:'numeric',year:'numeric',hour:'2-digit',minute:'2-digit'})+' ET';
-  const html = buildHTML({monthly,weekly,days,overall,updated});
+  const updated = now.toLocaleString('en-US',{timeZone:'America/New_York',month:'short',day:'numeric',year:'numeric',hour:'2-digit',minute:'2-digit'})+' ET';
+  const html = buildHTML({monthly,months,current,weekly,days,overall,updated});
   fs.writeFileSync('index.html',html);
   console.log(`Dashboard written — ${html.length} chars, ${all.length} tickets processed`);
 }
@@ -359,4 +383,4 @@ if (require.main === module) {
   main().catch(err=>{console.error('FATAL:',err.message);process.exit(1);});
 }
 
-module.exports = { fetchAllTickets, calcStats, getWeeks, getDays, buildHTML, main };
+module.exports = { fetchAllTickets, calcStats, getWeeks, getDays, buildHTML, listMonths, main };

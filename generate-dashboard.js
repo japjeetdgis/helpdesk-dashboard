@@ -2,9 +2,15 @@ const axios = require('axios');
 const fs = require('fs');
 
 const API_KEY = process.env.FRESHSERVICE_API_KEY;
-const DOMAIN = process.env.FRESHSERVICE_DOMAIN || 'support.patriotgis.com';
+const DOMAIN = process.env.FRESHSERVICE_DOMAIN || 'patriotgis.freshservice.com';
 const HD_GROUP = 17000367080;
-const MAR_CUTOFF = new Date('2026-03-01T00:00:00Z');
+const DATA_START = '2026-03-01T00:00:00Z';      // dashboard window start (Freshservice updated_since)
+const MAR_CUTOFF = new Date(DATA_START);
+const STATE_FILE = process.env.STATE_FILE || 'tickets.json'; // persisted ticket cache, committed to the repo
+const SYNC_OVERLAP_MS = 60 * 60 * 1000;          // re-scan the last hour each run so nothing slips a boundary
+const FULL_RESYNC_DAYS = 7;                       // periodic full reconcile to catch deletions updated_since can't see
+const RATE_LIMIT_SHARE = 0.30;                    // use at most 30% of this endpoint's per-minute limit (140 → 42 credits/min); leave the rest for agents & integrations
+const RATE_WINDOW_MS = 61000;                     // Freshservice sends no reset header, so wait one full minute (+1s) when the shared window is under pressure
 const auth = { username: API_KEY, password: 'X' };
 const baseURL = `https://${DOMAIN}/api/v2`;
 const avg = arr => arr.length ? arr.reduce((a,b)=>a+b,0)/arr.length : null;
@@ -39,18 +45,61 @@ async function withRetry(fn, { sleep, maxRetries, label }) {
     } catch (e) {
       const status = e.response?.status;
       if (!isRetryable(e) || attempt >= maxRetries) throw e;
-      const waitMs = status === 429 ? 30000 : 1000 * 2 ** attempt;
+      // On 429, Freshservice tells us exactly how long to wait via Retry-After.
+      const retryAfterSec = +(e.response?.headers?.['retry-after']) || 0;
+      const waitMs = status === 429 ? (retryAfterSec ? retryAfterSec * 1000 : 30000) : 1000 * 2 ** attempt;
       console.log(`  Request failed (HTTP ${status ?? e.code ?? e.message}) — retry ${attempt + 1}/${maxRetries} in ${waitMs}ms [${label}]`);
       await sleep(waitMs);
     }
   }
 }
 
-async function fetchAllTickets(opts = {}) {
-  const { client = axios, sleep = realSleep, maxPages = 150, maxRetries = 3 } = opts;
-  console.log(`Fetching tickets — domain: ${DOMAIN}, API key set: ${!!API_KEY} (${API_KEY?.length} chars)`);
+// Minimal, non-PII projection of a Freshservice ticket — only the fields the
+// metrics need. This is what we persist to STATE_FILE (a public repo), so it
+// must never carry subjects, descriptions, or requester info.
+function projectTicket(t) {
+  return {
+    id: t.id,
+    group_id: t.group_id,
+    created_at: t.created_at,
+    status: t.status,
+    fr_escalated: t.fr_escalated,
+    is_escalated: t.is_escalated,
+    stats: t.stats ? {
+      first_responded_at: t.stats.first_responded_at ?? null,
+      resolved_at: t.stats.resolved_at ?? null,
+      closed_at: t.stats.closed_at ?? null,
+    } : null,
+  };
+}
 
-  // Test connectivity first
+// Pacing for the paged fetch, driven by Freshservice's live rate-limit headers.
+// We hold ourselves to RATE_LIMIT_SHARE of the endpoint's per-minute limit
+// (x-ratelimit-total, the account-wide "List All Tickets" sub-limit). The cost of
+// a request varies — include=stats spends 2 (x-ratelimit-used-currentrequest) —
+// so we convert our credit budget to calls/min using the reported cost. If the
+// live window is already down to our share (heavy outside usage), we wait it out
+// rather than racing other consumers toward a 429.
+function nextDelayMs(headers = {}) {
+  const total = +headers['x-ratelimit-total'] || 140;
+  const remaining = +headers['x-ratelimit-remaining'];
+  const cost = Math.max(1, +headers['x-ratelimit-used-currentrequest'] || 1);
+  const creditsPerMin = Math.max(1, Math.floor(RATE_LIMIT_SHARE * total)); // 30% of 140 = 42
+  if (Number.isFinite(remaining) && remaining <= creditsPerMin) return RATE_WINDOW_MS;
+  const callsPerMin = Math.max(1, creditsPerMin / cost);                   // 42 credits ÷ 2 = 21 calls/min
+  return Math.ceil(60000 / callsPerMin);                                   // ~2857ms between calls
+}
+
+// Page the tickets list (newest-created first) with stats embedded, starting
+// from `sinceISO` (updated_since). Returns RAW tickets across all groups; the
+// caller filters/merges. `stopAtCutoff` stops paging once tickets predate the
+// data window — a backfill optimization that relies on created_at-desc ordering;
+// leave it off to page a full delta.
+async function pageTickets(sinceISO, opts = {}) {
+  const { client = axios, sleep = realSleep, maxPages = 550, maxRetries = 3, stopAtCutoff = false } = opts;
+  console.log(`Fetching tickets — domain: ${DOMAIN}, since: ${sinceISO}, API key set: ${!!API_KEY} (${API_KEY?.length} chars)`);
+
+  // Connectivity probe — fail fast and clearly before paging.
   try {
     const test = await withRetry(
       () => client.get(`${baseURL}/tickets`, { auth, params: { per_page: 1, page: 1 } }),
@@ -64,47 +113,98 @@ async function fetchAllTickets(opts = {}) {
     throw e;
   }
 
-  let all = [], page = 1;
+  const all = [];
+  let page = 1, reason = 'maxpages', lastCreated = Infinity;
   while (page <= maxPages) {
     let res;
     try {
       res = await withRetry(
         () => client.get(`${baseURL}/tickets`, {
           auth,
-          params: { per_page: 100, page, order_by: 'created_at', order_type: 'desc', updated_since: '2026-03-01T00:00:00Z' }
+          params: { per_page: 100, page, order_by: 'created_at', order_type: 'desc', updated_since: sinceISO, include: 'stats' }
         }),
         { sleep, maxRetries, label: `page ${page}` }
       );
     } catch(e) {
+      // A persistent page failure must abort the run: a partial fetch would drop
+      // tickets (backfill) or advance the sync watermark past unseen changes.
       console.error(`  Error page ${page} (gave up after ${maxRetries} retries): ${e.response?.status} ${e.message}`);
-      break;
+      throw e;
     }
     const tickets = res.data.tickets || [];
-    console.log(`  Page ${page}: ${tickets.length} tickets returned | HD so far: ${all.length}`);
-    if (!tickets.length) break;
+    console.log(`  Page ${page}: ${tickets.length} tickets | collected ${all.length}`);
+    if (!tickets.length) { reason = 'empty'; break; }
 
     let hitCutoff = false;
     for (const t of tickets) {
-      if (new Date(t.created_at) < MAR_CUTOFF) { hitCutoff = true; break; }
-      if (t.group_id === HD_GROUP) all.push(t);
+      if (stopAtCutoff) {
+        // The cutoff break below assumes created_at-desc order. Verify it holds
+        // rather than silently truncating the backfill if the API ever reorders.
+        const c = new Date(t.created_at).getTime();
+        if (c > lastCreated) throw new Error(`Tickets not in created_at-desc order (${t.created_at} after an older row) — cutoff unsafe; aborting to avoid a truncated backfill.`);
+        lastCreated = c;
+        if (c < MAR_CUTOFF.getTime()) { hitCutoff = true; break; }
+      }
+      all.push(t);
     }
-    if (hitCutoff) break;
-    if (tickets.length < 100) break;
+    if (hitCutoff) { reason = 'cutoff'; break; }
+    if (tickets.length < 100) { reason = 'lastpage'; break; }
     page++;
-    await sleep(150);
+    // Pace off the live rate-limit headers — never spend more than our 30% share.
+    await sleep(nextDelayMs(res.headers));
   }
-
-  console.log(`Fetch complete — ${all.length} HD tickets, ${page} pages`);
-  if (all.length === 0) throw new Error('Zero HD tickets fetched — API returned no data. Check API key and group ID.');
+  if (reason === 'maxpages') {
+    throw new Error(`Hit maxPages=${maxPages} before exhausting results — refusing to publish truncated data. Raise maxPages or move to incremental-only.`);
+  }
+  console.log(`Paged ${all.length} raw tickets (${reason})`);
   return all;
+}
+
+// Full scan of the data window (Mar 1 → now). Used for the first backfill and
+// the periodic reconcile; returns projected HD tickets, replacing any prior set.
+async function fetchAllTickets(opts = {}) {
+  const raw = await pageTickets(DATA_START, { ...opts, stopAtCutoff: true });
+  const hd = raw
+    .filter(t => t.group_id === HD_GROUP && new Date(t.created_at) >= MAR_CUTOFF)
+    .map(projectTicket);
+  console.log(`Backfill complete — ${hd.length} HD tickets`);
+  if (hd.length === 0) throw new Error('Zero HD tickets fetched — API returned no data. Check API key and group ID.');
+  return hd;
+}
+
+// Upsert a raw delta into the stored (projected) set, keyed by ticket id.
+// Tickets that left the HD group or fell outside the window are dropped, so the
+// store self-heals as tickets are reassigned.
+function mergeTickets(stored, rawDelta) {
+  const byId = new Map(stored.map(t => [t.id, t]));
+  for (const r of rawDelta) {
+    if (r.group_id === HD_GROUP && new Date(r.created_at) >= MAR_CUTOFF) byId.set(r.id, projectTicket(r));
+    else byId.delete(r.id);
+  }
+  return [...byId.values()];
+}
+
+function loadState() {
+  try {
+    const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    if (s && Array.isArray(s.tickets) && s.lastSyncedAt) return s;
+  } catch { /* missing or corrupt → caller backfills */ }
+  return null;
+}
+
+function saveState(state) {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state));
 }
 
 function calcStats(tickets) {
   const res = tickets.filter(t => t.status===4||t.status===5);
-  const frts = tickets.filter(t=>t.fr_escalated===false&&t.updated_at&&t.created_at)
-    .map(t=>(new Date(t.updated_at)-new Date(t.created_at))/3600000).filter(h=>h>0&&h<168);
-  const ttrs = res.filter(t=>t.closed_at&&t.created_at)
-    .map(t=>(new Date(t.closed_at)-new Date(t.created_at))/3600000).filter(h=>h>0&&h<8760);
+  // First-response and resolution times live in the embedded `stats` object
+  // (fetched with include=stats); the bare ticket list omits these timestamps,
+  // which is why avg response/resolution previously came back empty.
+  const frts = tickets.filter(t=>t.stats?.first_responded_at&&t.created_at)
+    .map(t=>(new Date(t.stats.first_responded_at)-new Date(t.created_at))/3600000).filter(h=>h>0&&h<168);
+  const ttrs = res.filter(t=>t.created_at&&(t.stats?.resolved_at||t.stats?.closed_at))
+    .map(t=>(new Date(t.stats.resolved_at||t.stats.closed_at)-new Date(t.created_at))/3600000).filter(h=>h>0&&h<8760);
   const frm = tickets.filter(t=>t.fr_escalated===false).length;
   const rem = tickets.filter(t=>t.is_escalated===false).length;
   const avgFRT = avg(frts), avgTTR = avg(ttrs);
@@ -361,8 +461,28 @@ new Chart(document.getElementById('volChart'),{type:'bar',data:{labels:dayLabels
 }
 
 async function main() {
-  const all = await fetchAllTickets();
   const now = new Date();
+  const prev = loadState();
+  const dueFullResync = !prev || !prev.lastFullSyncAt ||
+    (now - new Date(prev.lastFullSyncAt)) >= FULL_RESYNC_DAYS * 86400000;
+
+  let all, lastFullSyncAt;
+  if (dueFullResync) {
+    console.log(prev ? 'Mode: full reconcile (periodic)' : 'Mode: initial backfill');
+    all = await fetchAllTickets();
+    lastFullSyncAt = now.toISOString();
+  } else {
+    const since = new Date(new Date(prev.lastSyncedAt).getTime() - SYNC_OVERLAP_MS).toISOString();
+    console.log(`Mode: incremental — updated_since ${since}`);
+    const rawDelta = await pageTickets(since, { stopAtCutoff: false });
+    all = mergeTickets(prev.tickets, rawDelta);
+    lastFullSyncAt = prev.lastFullSyncAt;
+    console.log(`Delta: ${rawDelta.length} changed tickets → ${all.length} HD total`);
+  }
+
+  if (all.length === 0) throw new Error('Zero HD tickets after sync — aborting so we never publish an empty dashboard.');
+  saveState({ lastSyncedAt: now.toISOString(), lastFullSyncAt, tickets: all });
+
   const getMonth = (mo,yr) => all.filter(t=>{const d=new Date(t.created_at);return d.getUTCFullYear()===yr&&d.getUTCMonth()===mo;});
   const months = listMonths(MAR_CUTOFF, now);
   const monthly = {};
@@ -383,4 +503,4 @@ if (require.main === module) {
   main().catch(err=>{console.error('FATAL:',err.message);process.exit(1);});
 }
 
-module.exports = { fetchAllTickets, calcStats, getWeeks, getDays, buildHTML, listMonths, main };
+module.exports = { fetchAllTickets, pageTickets, nextDelayMs, mergeTickets, projectTicket, loadState, saveState, calcStats, getWeeks, getDays, buildHTML, listMonths, main };

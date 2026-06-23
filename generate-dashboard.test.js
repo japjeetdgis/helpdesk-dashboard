@@ -1,6 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { fetchAllTickets, calcStats, buildHTML, getDays, getWeeks, listMonths } = require('./generate-dashboard.js');
+const { fetchAllTickets, pageTickets, nextDelayMs, mergeTickets, projectTicket, calcStats, buildHTML, getDays, getWeeks, listMonths } = require('./generate-dashboard.js');
 
 const HD_GROUP = 17000367080;
 const noSleep = () => Promise.resolve();
@@ -53,6 +53,14 @@ test('A. hits the public /api/v2 endpoint, never the internal /api/_', async () 
   }
 });
 
+test('A2. requests embedded stats on the page fetch so response/resolution times exist', async () => {
+  const client = recordingClient(() => ok([ticket()]));
+  await fetchAllTickets({ client, sleep: noSleep });
+  const pageCall = client.calls.find((c) => c.config.params.per_page > 1);
+  assert.ok(pageCall, 'should make a paged fetch');
+  assert.equal(pageCall.config.params.include, 'stats', 'page fetch must request include=stats');
+});
+
 test('B. retries transient errors (503 then 404) and then succeeds', async () => {
   let n = 0;
   const client = recordingClient((url, config) => {
@@ -64,6 +72,19 @@ test('B. retries transient errors (503 then 404) and then succeeds', async () =>
   const all = await fetchAllTickets({ client, sleep: noSleep, maxRetries: 3 });
   assert.equal(all.length, 1);
   assert.ok(n >= 3, 'should have retried before succeeding');
+});
+
+test('B2. honors the Retry-After header on 429 instead of the default backoff', async () => {
+  const waits = [];
+  const recordSleep = (ms) => { waits.push(ms); return Promise.resolve(); };
+  let n = 0;
+  const client = recordingClient(() => {
+    n++;
+    if (n === 1) { const e = httpError(429); e.response.headers = { 'retry-after': '7' }; throw e; }
+    return ok([ticket()]);
+  });
+  await fetchAllTickets({ client, sleep: recordSleep, maxRetries: 3 });
+  assert.ok(waits.includes(7000), `expected a 7s wait from Retry-After, got ${waits}`);
 });
 
 test('C. throws after exhausting retries on persistent transient errors', async () => {
@@ -107,17 +128,27 @@ test('E. keeps only HD-group tickets and stops at the March cutoff', async () =>
 
 // --- calcStats (characterization: locks current math) -----------------------
 
-test('F. calcStats computes the current metric definitions', () => {
+test('F. calcStats derives response time from stats.first_responded_at and resolution from stats.resolved_at', () => {
   const tickets = [
-    { status: 4, fr_escalated: false, is_escalated: false, created_at: '2026-03-01T00:00:00Z', updated_at: '2026-03-01T02:00:00Z', closed_at: '2026-03-01T10:00:00Z' }, // FRT 2h, TTR 10h
-    { status: 5, fr_escalated: false, is_escalated: false, created_at: '2026-03-02T00:00:00Z', updated_at: '2026-03-02T04:00:00Z', closed_at: '2026-03-03T00:00:00Z' }, // FRT 4h, TTR 24h
-    { status: 3, fr_escalated: true,  is_escalated: false, created_at: '2026-03-03T00:00:00Z', updated_at: '2026-03-03T06:00:00Z' },
-    { status: 2, fr_escalated: false, is_escalated: true,  created_at: '2026-03-04T00:00:00Z', updated_at: '2026-03-04T03:00:00Z' }, // FRT 3h
+    { status: 4, fr_escalated: false, is_escalated: false, created_at: '2026-03-01T00:00:00Z', stats: { first_responded_at: '2026-03-01T02:00:00Z', resolved_at: '2026-03-01T10:00:00Z' } }, // FRT 2h, TTR 10h
+    { status: 5, fr_escalated: false, is_escalated: false, created_at: '2026-03-02T00:00:00Z', stats: { first_responded_at: '2026-03-02T04:00:00Z', resolved_at: '2026-03-03T00:00:00Z' } }, // FRT 4h, TTR 24h
+    { status: 3, fr_escalated: true,  is_escalated: false, created_at: '2026-03-03T00:00:00Z', stats: { first_responded_at: '2026-03-03T06:00:00Z' } }, // FRT 6h (counted now: not gated on fr_escalated)
+    { status: 2, fr_escalated: false, is_escalated: true,  created_at: '2026-03-04T00:00:00Z', stats: { first_responded_at: '2026-03-04T04:00:00Z' } }, // FRT 4h
   ];
   assert.deepEqual(calcStats(tickets), {
     total: 4, resolved: 2, pending: 1, stillOpen: 2,
-    frSLA: 75, overSLA: 75, avgFRT: 3, avgTTR: 17, frtToRes: 14, fcr: 100,
+    frSLA: 75, overSLA: 75, avgFRT: 4, avgTTR: 17, frtToRes: 13, fcr: 100,
   });
+});
+
+test('F1. calcStats ignores response/resolution times when stats is absent', () => {
+  // A ticket list fetched without include=stats has no timestamps to measure.
+  const tickets = [
+    { status: 4, fr_escalated: false, is_escalated: false, created_at: '2026-03-01T00:00:00Z', closed_at: '2026-03-01T10:00:00Z' },
+  ];
+  const s = calcStats(tickets);
+  assert.equal(s.avgFRT, null);
+  assert.equal(s.avgTTR, null);
 });
 
 test('F2. calcStats handles an empty set without dividing by zero', () => {
@@ -208,4 +239,70 @@ test('K. buildHTML renders the current month and full history dynamically', () =
   assert.match(html, /Current month — July 2026/);
   assert.match(html, /March 2026/);
   assert.doesNotMatch(html, /Current month — June 2026/);
+});
+
+// --- incremental sync -------------------------------------------------------
+
+test('L. projectTicket keeps only the non-PII metric fields', () => {
+  const p = projectTicket({
+    id: 1, group_id: HD_GROUP, created_at: 'c', status: 2, fr_escalated: false, is_escalated: false,
+    subject: 'SECRET', description_text: 'PII', requester_id: 42,
+    stats: { first_responded_at: 'a', resolved_at: 'b', closed_at: 'd', agent_responded_at: 'drop' },
+  });
+  assert.deepEqual(Object.keys(p).sort(), ['created_at', 'fr_escalated', 'group_id', 'id', 'is_escalated', 'stats', 'status']);
+  assert.equal(p.subject, undefined);
+  assert.equal(p.requester_id, undefined);
+  assert.deepEqual(Object.keys(p.stats).sort(), ['closed_at', 'first_responded_at', 'resolved_at']);
+});
+
+test('M. mergeTickets upserts changed HD tickets, adds new, drops moved-out and pre-cutoff', () => {
+  const stored = [
+    projectTicket({ id: 1, group_id: HD_GROUP, created_at: '2026-03-10T00:00:00Z', status: 2, fr_escalated: false, is_escalated: false }),
+    projectTicket({ id: 2, group_id: HD_GROUP, created_at: '2026-03-11T00:00:00Z', status: 2, fr_escalated: false, is_escalated: false }),
+  ];
+  const delta = [
+    { id: 1, group_id: HD_GROUP, created_at: '2026-03-10T00:00:00Z', status: 4, fr_escalated: false, is_escalated: false, stats: { first_responded_at: '2026-03-10T01:00:00Z', resolved_at: '2026-03-12T00:00:00Z', closed_at: null } }, // changed → resolved
+    { id: 2, group_id: 999, created_at: '2026-03-11T00:00:00Z', status: 2, fr_escalated: false, is_escalated: false }, // moved out of HD → drop
+    { id: 3, group_id: HD_GROUP, created_at: '2026-03-15T00:00:00Z', status: 2, fr_escalated: false, is_escalated: false }, // new HD
+    { id: 4, group_id: HD_GROUP, created_at: '2026-02-01T00:00:00Z', status: 2, fr_escalated: false, is_escalated: false }, // pre-cutoff → ignore
+  ];
+  const merged = mergeTickets(stored, delta);
+  assert.deepEqual(merged.map(t => t.id).sort((a, b) => a - b), [1, 3]);
+  const t1 = merged.find(t => t.id === 1);
+  assert.equal(t1.status, 4);                              // upserted in place
+  assert.equal(t1.stats.resolved_at, '2026-03-12T00:00:00Z');
+});
+
+test('O. nextDelayMs caps throughput at 30% of the live endpoint limit, cost-aware', () => {
+  // Enterprise List-All-Tickets limit 140 → 42 credits/min; include=stats costs 2 → 21 calls/min
+  assert.equal(nextDelayMs({ 'x-ratelimit-total': '140', 'x-ratelimit-remaining': '138', 'x-ratelimit-used-currentrequest': '2' }), Math.ceil(60000 / 21));
+  // a 1-credit call → the full 42 calls/min
+  assert.equal(nextDelayMs({ 'x-ratelimit-total': '140', 'x-ratelimit-remaining': '138', 'x-ratelimit-used-currentrequest': '1' }), Math.ceil(60000 / 42));
+  // heavy outside usage: remaining at/below our 30% budget → wait out the window
+  assert.equal(nextDelayMs({ 'x-ratelimit-total': '140', 'x-ratelimit-remaining': '42', 'x-ratelimit-used-currentrequest': '2' }), 61000);
+  // missing headers → assume the 140 limit at cost 1
+  assert.equal(nextDelayMs({}), Math.ceil(60000 / 42));
+});
+
+test('N. pageTickets(stopAtCutoff=false) pages the whole delta regardless of created_at', async () => {
+  const p1 = Array.from({ length: 100 }, (_, i) => ticket({ id: i, created_at: '2026-01-01T00:00:00Z' })); // all pre-cutoff
+  const p2 = [ticket({ id: 999, created_at: '2026-05-01T00:00:00Z' })];
+  const client = recordingClient((url, config) => {
+    if (isProbe(config)) return ok([ticket()]);
+    return ok(config.params.page === 1 ? p1 : p2);
+  });
+  const raw = await pageTickets('2026-04-01T00:00:00Z', { client, sleep: noSleep, stopAtCutoff: false });
+  assert.equal(raw.length, 101); // did not stop early on the pre-cutoff page
+});
+
+test('P. pageTickets(stopAtCutoff) aborts if results arrive out of created_at-desc order', async () => {
+  const outOfOrder = [
+    ticket({ id: 1, created_at: '2026-05-10T00:00:00Z' }),
+    ticket({ id: 2, created_at: '2026-05-20T00:00:00Z' }), // newer than the previous row → desc order violated
+  ];
+  const client = recordingClient((url, config) => (isProbe(config) ? ok([ticket()]) : ok(outOfOrder)));
+  await assert.rejects(
+    pageTickets('2026-03-01T00:00:00Z', { client, sleep: noSleep, stopAtCutoff: true }),
+    /created_at-desc order/,
+  );
 });

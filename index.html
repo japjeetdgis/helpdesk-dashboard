@@ -64,7 +64,7 @@ hr{border:none;border-top:1px solid var(--border);margin:32px 0}
 </style></head><body>
 <div class="header"><div class="header-inner">
   <div><div class="eyebrow">Patriot Growth Insurance Services · IT Operations</div><h1>Help Desk <span>Performance</span> Dashboard</h1></div>
-  <div><div class="auto-badge">⚡ Auto-updated · Aug 8, 2026, 02:59 AM ET</div><div class="header-sub">Freshservice · HD Team · All statuses incl. pending · Runs nightly 2AM ET</div></div>
+  <div><div class="auto-badge">⚡ Auto-updated · Aug 9, 2026, 03:02 AM ET</div><div class="header-sub">Freshservice · HD Team · All statuses incl. pending · Runs nightly 2AM ET</div></div>
 </div></div>
 
 <div class="page">
@@ -166,20 +166,20 @@ hr{border:none;border-top:1px solid var(--border);margin:32px 0}
 <hr>
 <div class="footer">
   <span>PGIS IT Operations · HD Team (17000367080) · All statuses · Auto-updated nightly</span>
-  <span>japjeetdgis.github.io/helpdesk-dashboard · Aug 8, 2026, 02:59 AM ET</span>
+  <span>japjeetdgis.github.io/helpdesk-dashboard · Aug 9, 2026, 03:02 AM ET</span>
 </div>
 </div>
 
 <script>
 const wkLabels=["Wk 1\nAug 1–7","Wk 2\nAug 8–14"],wkBg=["#2B5CE6","#1A7A52"];
-const dayLabels=["Aug 1","Aug 2","Aug 3","Aug 4","Aug 5","Aug 6","Aug 7","Aug 8"],dayColors=["#C8C5BC","#C8C5BC","#2B5CE6","#2B5CE6","#2B5CE6","#2B5CE6","#2B5CE6","#C8C5BC"];
+const dayLabels=["Aug 1","Aug 2","Aug 3","Aug 4","Aug 5","Aug 6","Aug 7","Aug 8","Aug 9"],dayColors=["#C8C5BC","#C8C5BC","#2B5CE6","#2B5CE6","#2B5CE6","#2B5CE6","#2B5CE6","#C8C5BC","#C8C5BC"];
 const mkOpts=(yMin,yMax,sfx)=>({responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:i=>i.raw!=null?' '+i.raw+sfx:' no data'}}},scales:{x:{ticks:{color:'#9B9890',font:{size:10},autoSkip:false,maxRotation:45},grid:{display:false}},y:{min:yMin,max:yMax,ticks:{color:'#9B9890',font:{size:10},callback:v=>v+sfx},grid:{color:'rgba(0,0,0,0.05)'}}}});
 new Chart(document.getElementById('wk_vol'),{type:'bar',data:{labels:wkLabels,datasets:[{data:[495,1],backgroundColor:wkBg,borderRadius:4,barPercentage:.5}]},options:mkOpts(0,null,'')});
 new Chart(document.getElementById('wk_frt'),{type:'bar',data:{labels:wkLabels,datasets:[{data:[12.3,null],backgroundColor:wkBg,borderRadius:4,barPercentage:.5}]},options:mkOpts(0,null,'h')});
 new Chart(document.getElementById('wk_ttr'),{type:'bar',data:{labels:wkLabels,datasets:[{data:[27.9,null],backgroundColor:wkBg,borderRadius:4,barPercentage:.5}]},options:mkOpts(0,null,'h')});
 new Chart(document.getElementById('wk_fr2r'),{type:'bar',data:{labels:wkLabels,datasets:[{data:[15.6,null],backgroundColor:wkBg,borderRadius:4,barPercentage:.5}]},options:mkOpts(0,null,'h')});
-new Chart(document.getElementById('slaChart'),{type:'bar',data:{labels:dayLabels,datasets:[{data:[33.3,40.9,69.2,75.9,75.3,98.4,98.4,100],backgroundColor:dayColors,borderRadius:3,barPercentage:.65},{data:dayLabels.map(()=>90),type:'line',borderColor:'#B03A2E',borderWidth:1.5,borderDash:[5,3],pointRadius:0,fill:false}]},options:mkOpts(70,105,'%')});
-new Chart(document.getElementById('frtChart'),{type:'bar',data:{labels:dayLabels,datasets:[{data:[64.6,69.6,14.5,9.2,9.6,3.5,1.3,null],backgroundColor:dayColors,borderRadius:3,barPercentage:.65}]},options:mkOpts(0,null,'h')});
-new Chart(document.getElementById('ttrChart'),{type:'bar',data:{labels:dayLabels,datasets:[{data:[80.5,81.8,35.6,31.1,17.9,9.9,2.9,null],backgroundColor:dayColors,borderRadius:3,barPercentage:.65}]},options:mkOpts(0,null,'h')});
-new Chart(document.getElementById('volChart'),{type:'bar',data:{labels:dayLabels,datasets:[{data:[21,22,107,137,85,61,62,1],backgroundColor:dayColors,borderRadius:3,barPercentage:.65}]},options:mkOpts(0,null,'')});
+new Chart(document.getElementById('slaChart'),{type:'bar',data:{labels:dayLabels,datasets:[{data:[33.3,40.9,69.2,75.9,75.3,98.4,98.4,100,0],backgroundColor:dayColors,borderRadius:3,barPercentage:.65},{data:dayLabels.map(()=>90),type:'line',borderColor:'#B03A2E',borderWidth:1.5,borderDash:[5,3],pointRadius:0,fill:false}]},options:mkOpts(70,105,'%')});
+new Chart(document.getElementById('frtChart'),{type:'bar',data:{labels:dayLabels,datasets:[{data:[64.6,69.6,14.5,9.2,9.6,3.5,1.3,null,null],backgroundColor:dayColors,borderRadius:3,barPercentage:.65}]},options:mkOpts(0,null,'h')});
+new Chart(document.getElementById('ttrChart'),{type:'bar',data:{labels:dayLabels,datasets:[{data:[80.5,81.8,35.6,31.1,17.9,9.9,2.9,null,null],backgroundColor:dayColors,borderRadius:3,barPercentage:.65}]},options:mkOpts(0,null,'h')});
+new Chart(document.getElementById('volChart'),{type:'bar',data:{labels:dayLabels,datasets:[{data:[21,22,107,137,85,61,62,1,0],backgroundColor:dayColors,borderRadius:3,barPercentage:.65}]},options:mkOpts(0,null,'')});
 </script></body></html>

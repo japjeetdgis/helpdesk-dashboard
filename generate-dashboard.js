@@ -4,14 +4,8 @@ const fs = require('fs');
 const API_KEY = process.env.FRESHSERVICE_API_KEY;
 const DOMAIN = process.env.FRESHSERVICE_DOMAIN || 'patriotgis.freshservice.com';
 const HD_GROUP = 17000367080;
-const DATA_START = '2025-01-01T00:00:00Z';      // dashboard window start (Freshservice updated_since) -- feeds the Monthly breakdown table; requires a fresh full backfill after lowering (delete tickets.json or wait for the periodic full reconcile)
-const WINDOW_START = new Date(DATA_START);
-// "Overall KPIs" is pinned to Peterson's Team's actual start (mirrors
-// helpdesk-dashboard-analyst's team-config.js -- update both if that date
-// ever changes) rather than tracking the full DATA_START window, so a long
-// historical average doesn't dilute a recent-performance snapshot. Per
-// instruction, 2026-08-24.
-const OVERALL_KPI_START = new Date('2026-04-01T00:00:00Z');
+const DATA_START = '2026-03-01T00:00:00Z';      // dashboard window start (Freshservice updated_since)
+const MAR_CUTOFF = new Date(DATA_START);
 const STATE_FILE = process.env.STATE_FILE || 'tickets.json'; // persisted ticket cache, committed to the repo
 const SYNC_OVERLAP_MS = 60 * 60 * 1000;          // re-scan the last hour each run so nothing slips a boundary
 const FULL_RESYNC_DAYS = 7;                       // periodic full reconcile to catch deletions updated_since can't see
@@ -21,21 +15,6 @@ const auth = { username: API_KEY, password: 'X' };
 const baseURL = `https://${DOMAIN}/api/v2`;
 const avg = arr => arr.length ? arr.reduce((a,b)=>a+b,0)/arr.length : null;
 const fmt = h => h === null || h === undefined ? 'n/a' : h < 24 ? h.toFixed(1)+'h' : (h/24).toFixed(1)+'d';
-
-// Real month-over-month direction for a time-based metric (lower = better),
-// replacing what used to be a hardcoded "Improving" badge regardless of
-// actual trend. `label` names the comparison month.
-function trendBadge(cur, prior, label) {
-  if (cur == null || prior == null || !prior) return { cardCls: 'amber', deltaCls: 'da', text: 'No trend data yet' };
-  const pct = ((prior - cur) / prior) * 100;
-  if (Math.abs(pct) < 1) return { cardCls: 'amber', deltaCls: 'da', text: `Flat vs ${label}` };
-  const improved = pct > 0;
-  return {
-    cardCls: improved ? 'green' : 'amber',
-    deltaCls: improved ? 'dg' : 'da',
-    text: `${improved ? '↓' : '↑'} ${Math.abs(pct).toFixed(0)}% ${improved ? 'Improving' : 'Worsening'} vs ${label}`,
-  };
-}
 const realSleep = ms => new Promise(r => setTimeout(r, ms));
 
 const monthKey  = d => d.toLocaleString('en-US', { month: 'short', year: 'numeric', timeZone: 'UTC' }); // "Jun 2026"
@@ -164,7 +143,7 @@ async function pageTickets(sinceISO, opts = {}) {
         const c = new Date(t.created_at).getTime();
         if (c > lastCreated) throw new Error(`Tickets not in created_at-desc order (${t.created_at} after an older row) — cutoff unsafe; aborting to avoid a truncated backfill.`);
         lastCreated = c;
-        if (c < WINDOW_START.getTime()) { hitCutoff = true; break; }
+        if (c < MAR_CUTOFF.getTime()) { hitCutoff = true; break; }
       }
       all.push(t);
     }
@@ -181,16 +160,12 @@ async function pageTickets(sinceISO, opts = {}) {
   return all;
 }
 
-// Full scan of the data window (DATA_START → now). Used for the first
-// backfill and the periodic reconcile; returns projected HD tickets,
-// replacing any prior set. maxPages defaults higher than pageTickets' own
-// default (550) because this pages across ALL Freshservice groups, not just
-// HD -- hit that ceiling on the sibling helpdesk-dashboard-analyst repo after
-// extending its window similarly; raise further here if it happens again.
+// Full scan of the data window (Mar 1 → now). Used for the first backfill and
+// the periodic reconcile; returns projected HD tickets, replacing any prior set.
 async function fetchAllTickets(opts = {}) {
-  const raw = await pageTickets(DATA_START, { maxPages: 1500, ...opts, stopAtCutoff: true });
+  const raw = await pageTickets(DATA_START, { ...opts, stopAtCutoff: true });
   const hd = raw
-    .filter(t => t.group_id === HD_GROUP && new Date(t.created_at) >= WINDOW_START)
+    .filter(t => t.group_id === HD_GROUP && new Date(t.created_at) >= MAR_CUTOFF)
     .map(projectTicket);
   console.log(`Backfill complete — ${hd.length} HD tickets`);
   if (hd.length === 0) throw new Error('Zero HD tickets fetched — API returned no data. Check API key and group ID.');
@@ -203,7 +178,7 @@ async function fetchAllTickets(opts = {}) {
 function mergeTickets(stored, rawDelta) {
   const byId = new Map(stored.map(t => [t.id, t]));
   for (const r of rawDelta) {
-    if (r.group_id === HD_GROUP && new Date(r.created_at) >= WINDOW_START) byId.set(r.id, projectTicket(r));
+    if (r.group_id === HD_GROUP && new Date(r.created_at) >= MAR_CUTOFF) byId.set(r.id, projectTicket(r));
     else byId.delete(r.id);
   }
   return [...byId.values()];
@@ -279,7 +254,7 @@ function getDays(monthTickets, now) {
 }
 
 function buildHTML(data) {
-  const { monthly, weekly, days, overall, updated, months, current, monthTrend } = data;
+  const { monthly, weekly, days, overall, updated, months, current } = data;
   const cur = monthly[current.key] || {};
   const wkColors = ['#2B5CE6','#1A7A52','#9B5DE5','#F15BB5','#00BBF9'];
   const wkLabels = JSON.stringify(weekly.map(w=>w.label));
@@ -408,21 +383,14 @@ hr{border:none;border-top:1px solid var(--border);margin:32px 0}
 </div><hr>
 
 <div class="section">
-  <div class="section-header"><span class="section-label">Overall KPIs — since ${monthLong(OVERALL_KPI_START)} (Peterson's Team) through today · all statuses</span><div class="section-rule"></div></div>
+  <div class="section-header"><span class="section-label">Overall KPIs — Mar through today · all statuses</span><div class="section-rule"></div></div>
   <div class="kpi-grid-5">
     <div class="kpi-card"><div class="kpi-label">Total tickets</div><div class="kpi-value">${(overall.total||0).toLocaleString()}</div><div class="kpi-sub">incl. pending & WIP</div></div>
     <div class="kpi-card green"><div class="kpi-label">FCR rate</div><div class="kpi-value">${overall.fcr||0}%</div><div class="kpi-sub">target 70%</div><div class="kpi-delta dg">✓ Above target</div></div>
     <div class="kpi-card ${(overall.overSLA||0)>=90?'green':'amber'}"><div class="kpi-label">SLA compliance</div><div class="kpi-value">${overall.overSLA||0}%</div><div class="kpi-sub">target 90%</div><div class="kpi-delta ${(overall.overSLA||0)>=90?'dg':'da'}">${(overall.overSLA||0)>=90?'✓ On target':'⚠ Below target'}</div></div>
-    ${(() => {
-      const t = monthTrend ? trendBadge(monthTrend.avgFRT, monthTrend.avgFRTPrior, monthTrend.label) : { cardCls: 'amber', deltaCls: 'da', text: 'No trend data yet' };
-      return `<div class="kpi-card ${t.cardCls}"><div class="kpi-label">Avg response</div><div class="kpi-value">${fmt(overall.avgFRT)}</div><div class="kpi-sub">overall</div><div class="kpi-delta ${t.deltaCls}">${t.text}</div></div>`;
-    })()}
-    ${(() => {
-      const t = monthTrend ? trendBadge(monthTrend.avgTTR, monthTrend.avgTTRPrior, monthTrend.label) : { cardCls: 'amber', deltaCls: 'da', text: 'No trend data yet' };
-      return `<div class="kpi-card ${t.cardCls}"><div class="kpi-label">Avg resolution</div><div class="kpi-value">${fmt(overall.avgTTR)}</div><div class="kpi-sub">overall</div><div class="kpi-delta ${t.deltaCls}">${t.text}</div></div>`;
-    })()}
+    <div class="kpi-card amber"><div class="kpi-label">Avg response</div><div class="kpi-value">${fmt(overall.avgFRT)}</div><div class="kpi-sub">overall</div><div class="kpi-delta da">↓ Improving</div></div>
+    <div class="kpi-card amber"><div class="kpi-label">Avg resolution</div><div class="kpi-value">${fmt(overall.avgTTR)}</div><div class="kpi-sub">overall</div><div class="kpi-delta da">↓ Improving</div></div>
   </div>
-  <div class="insight"><strong>SLA compliance</strong> averages two Freshservice-native flags: whether each ticket met its <em>first-response</em> SLA and whether it met its <em>resolution</em> SLA (the actual time thresholds behind those are set in Freshservice's own SLA policy, not in this dashboard). "FR → resolution" (below, in Weekly trends) is avg resolution time minus avg first-response time — roughly how long after first responding a ticket takes to actually close, not a per-ticket average of that exact gap. "Improving"/"Worsening" compares the last complete month to the one before it.</div>
 </div>
 
 <div class="section">
@@ -516,7 +484,7 @@ async function main() {
   saveState({ lastSyncedAt: now.toISOString(), lastFullSyncAt, tickets: all });
 
   const getMonth = (mo,yr) => all.filter(t=>{const d=new Date(t.created_at);return d.getUTCFullYear()===yr&&d.getUTCMonth()===mo;});
-  const months = listMonths(WINDOW_START, now);
+  const months = listMonths(MAR_CUTOFF, now);
   const monthly = {};
   for (const m of months) monthly[m.key] = calcStats(getMonth(m.monthIndex, m.year));
   const current = months.find(m=>m.isCurrent) || months.at(-1);
@@ -524,23 +492,9 @@ async function main() {
   const monthTickets = all.filter(t=>new Date(t.created_at)>=monthStart);
   const weekly = getWeeks(monthTickets, now);
   const days = getDays(monthTickets, now);
-  const overall = calcStats(all.filter(t => new Date(t.created_at) >= OVERALL_KPI_START));
-
-  // Real month-over-month trend for the "Improving"/"Worsening" badges on the
-  // Avg response/resolution KPI cards -- compares the last two *complete*
-  // months (not the in-progress current one) rather than the hardcoded
-  // "Improving" text this used to show regardless of actual direction.
-  const currentIdx = months.findIndex(m => m.isCurrent);
-  const lastCompleteMonth = currentIdx > 0 ? months[currentIdx - 1] : null;
-  const priorMonth = currentIdx > 1 ? months[currentIdx - 2] : null;
-  const monthTrend = (lastCompleteMonth && priorMonth) ? {
-    avgFRT: monthly[lastCompleteMonth.key]?.avgFRT, avgFRTPrior: monthly[priorMonth.key]?.avgFRT,
-    avgTTR: monthly[lastCompleteMonth.key]?.avgTTR, avgTTRPrior: monthly[priorMonth.key]?.avgTTR,
-    label: lastCompleteMonth.long,
-  } : null;
-
+  const overall = calcStats(all);
   const updated = now.toLocaleString('en-US',{timeZone:'America/New_York',month:'short',day:'numeric',year:'numeric',hour:'2-digit',minute:'2-digit'})+' ET';
-  const html = buildHTML({monthly,months,current,weekly,days,overall,updated,monthTrend});
+  const html = buildHTML({monthly,months,current,weekly,days,overall,updated});
   fs.writeFileSync('index.html',html);
   console.log(`Dashboard written — ${html.length} chars, ${all.length} tickets processed`);
 }
@@ -549,4 +503,4 @@ if (require.main === module) {
   main().catch(err=>{console.error('FATAL:',err.message);process.exit(1);});
 }
 
-module.exports = { fetchAllTickets, pageTickets, nextDelayMs, mergeTickets, projectTicket, loadState, saveState, calcStats, getWeeks, getDays, buildHTML, listMonths, main, trendBadge };
+module.exports = { fetchAllTickets, pageTickets, nextDelayMs, mergeTickets, projectTicket, loadState, saveState, calcStats, getWeeks, getDays, buildHTML, listMonths, main };

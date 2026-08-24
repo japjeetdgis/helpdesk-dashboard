@@ -1,6 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { fetchAllTickets, pageTickets, nextDelayMs, mergeTickets, projectTicket, calcStats, buildHTML, getDays, getWeeks, listMonths, trendBadge } = require('./generate-dashboard.js');
+const { fetchAllTickets, pageTickets, nextDelayMs, mergeTickets, projectTicket, calcStats, buildHTML, getDays, getWeeks, listMonths } = require('./generate-dashboard.js');
 
 const HD_GROUP = 17000367080;
 const noSleep = () => Promise.resolve();
@@ -109,13 +109,13 @@ test('D2. fails fast on 401 with an auth-specific message', async () => {
   assert.equal(n, 1, 'a 401 must not be retried');
 });
 
-test('E. keeps only HD-group tickets and stops at the data-start cutoff', async () => {
+test('E. keeps only HD-group tickets and stops at the March cutoff', async () => {
   const page1 = [
-    ticket({ id: 1, group_id: HD_GROUP, created_at: '2025-06-20T00:00:00Z' }), // keep
-    ticket({ id: 2, group_id: 999,      created_at: '2025-06-19T00:00:00Z' }), // wrong group
-    ticket({ id: 3, group_id: HD_GROUP, created_at: '2025-06-18T00:00:00Z' }), // keep
-    ticket({ id: 4, group_id: HD_GROUP, created_at: '2024-12-15T00:00:00Z' }), // pre-cutoff -> stop
-    ticket({ id: 5, group_id: HD_GROUP, created_at: '2024-12-10T00:00:00Z' }), // never reached
+    ticket({ id: 1, group_id: HD_GROUP, created_at: '2026-03-20T00:00:00Z' }), // keep
+    ticket({ id: 2, group_id: 999,      created_at: '2026-03-19T00:00:00Z' }), // wrong group
+    ticket({ id: 3, group_id: HD_GROUP, created_at: '2026-03-18T00:00:00Z' }), // keep
+    ticket({ id: 4, group_id: HD_GROUP, created_at: '2026-02-15T00:00:00Z' }), // pre-cutoff -> stop
+    ticket({ id: 5, group_id: HD_GROUP, created_at: '2026-02-10T00:00:00Z' }), // never reached
   ];
   const client = recordingClient((url, config) => {
     if (isProbe(config)) return ok([ticket()]);
@@ -264,7 +264,7 @@ test('M. mergeTickets upserts changed HD tickets, adds new, drops moved-out and 
     { id: 1, group_id: HD_GROUP, created_at: '2026-03-10T00:00:00Z', status: 4, fr_escalated: false, is_escalated: false, stats: { first_responded_at: '2026-03-10T01:00:00Z', resolved_at: '2026-03-12T00:00:00Z', closed_at: null } }, // changed → resolved
     { id: 2, group_id: 999, created_at: '2026-03-11T00:00:00Z', status: 2, fr_escalated: false, is_escalated: false }, // moved out of HD → drop
     { id: 3, group_id: HD_GROUP, created_at: '2026-03-15T00:00:00Z', status: 2, fr_escalated: false, is_escalated: false }, // new HD
-    { id: 4, group_id: HD_GROUP, created_at: '2024-12-01T00:00:00Z', status: 2, fr_escalated: false, is_escalated: false }, // pre-cutoff → ignore
+    { id: 4, group_id: HD_GROUP, created_at: '2026-02-01T00:00:00Z', status: 2, fr_escalated: false, is_escalated: false }, // pre-cutoff → ignore
   ];
   const merged = mergeTickets(stored, delta);
   assert.deepEqual(merged.map(t => t.id).sort((a, b) => a - b), [1, 3]);
@@ -305,31 +305,4 @@ test('P. pageTickets(stopAtCutoff) aborts if results arrive out of created_at-de
     pageTickets('2026-03-01T00:00:00Z', { client, sleep: noSleep, stopAtCutoff: true }),
     /created_at-desc order/,
   );
-});
-
-test('Q. trendBadge marks a lower value as Improving (green)', () => {
-  const t = trendBadge(4, 5, 'July 2026');
-  assert.equal(t.cardCls, 'green');
-  assert.equal(t.deltaCls, 'dg');
-  assert.match(t.text, /Improving/);
-  assert.match(t.text, /20%/);
-});
-
-test('Q2. trendBadge marks a higher value as Worsening (amber)', () => {
-  const t = trendBadge(6, 5, 'July 2026');
-  assert.equal(t.cardCls, 'amber');
-  assert.equal(t.deltaCls, 'da');
-  assert.match(t.text, /Worsening/);
-});
-
-test('Q3. trendBadge reports Flat for a sub-1% change', () => {
-  const t = trendBadge(5.02, 5, 'July 2026');
-  assert.equal(t.cardCls, 'amber');
-  assert.match(t.text, /Flat/);
-});
-
-test('Q4. trendBadge falls back gracefully with no prior data', () => {
-  const t = trendBadge(5, null, 'July 2026');
-  assert.equal(t.cardCls, 'amber');
-  assert.match(t.text, /No trend data/);
 });

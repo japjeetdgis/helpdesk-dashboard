@@ -1,11 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert');
-const {
-  fetchAllTickets, fetchAllTicketsRaw, filterHdTickets, pageTickets, nextDelayMs, mergeTickets, projectTicket,
-  calcStats, buildHTML, getDays, getWeeks, listMonths, trendBadge,
-  extractRoutingCandidates, extractGroupHistory, classifyRouting, fetchTicketActivities,
-  loadRoutingState, saveRoutingState, updateRoutingHistory,
-} = require('./generate-dashboard.js');
+const { fetchAllTickets, pageTickets, nextDelayMs, mergeTickets, projectTicket, calcStats, buildHTML, getDays, getWeeks, listMonths, trendBadge } = require('./generate-dashboard.js');
 
 const HD_GROUP = 17000367080;
 const noSleep = () => Promise.resolve();
@@ -194,29 +189,6 @@ test('G2. buildHTML renders a populated week', () => {
   assert.match(html, /Jun 1–7/);
 });
 
-test('G3. buildHTML renders the Cross-group routing section when routingSummary is provided', () => {
-  const html = buildHTML({
-    monthly: { 'Jun 2026': calcStats([]) },
-    months: [{ key: 'Jun 2026', long: 'June 2026', isCurrent: true }],
-    current: { key: 'Jun 2026', long: 'June 2026' },
-    weekly: [], days: [], overall: calcStats([]), updated: 'x',
-    routingSummary: { totalCandidates: 40, totalChecked: 10, routedOutCount: 3, byDestGroup: [{ groupName: 'Application Development', count: 3 }] },
-  });
-  assert.match(html, /Cross-group routing/);
-  assert.match(html, /Application Development/);
-  assert.match(html, /30 candidates are still unchecked/);
-});
-
-test('G4. buildHTML omits the Cross-group routing section when routingSummary is absent', () => {
-  const html = buildHTML({
-    monthly: { 'Jun 2026': calcStats([]) },
-    months: [{ key: 'Jun 2026', long: 'June 2026', isCurrent: true }],
-    current: { key: 'Jun 2026', long: 'June 2026' },
-    weekly: [], days: [], overall: calcStats([]), updated: 'x',
-  });
-  assert.doesNotMatch(html, /Cross-group routing/);
-});
-
 // --- date-window rollover (PR2): derive the window from "now" ----------------
 
 const dayTicket = (created_at) => ({ created_at, status: 2, fr_escalated: false, is_escalated: false, updated_at: created_at });
@@ -360,113 +332,4 @@ test('Q4. trendBadge falls back gracefully with no prior data', () => {
   const t = trendBadge(5, null, 'July 2026');
   assert.equal(t.cardCls, 'amber');
   assert.match(t.text, /No trend data/);
-});
-
-// --- cross-group routing -----------------------------------------------------
-
-// Real GET /tickets/{id}/activities response (trimmed to the relevant
-// entries), captured 2026-08-24: a ticket created directly into Help Desk
-// Team (17000367080), later reassigned to Application Development
-// (17000390475). Activities come back newest-first, matching the real API.
-const REAL_ACTIVITIES_SAMPLE = [
-  { actor: { id: 17002306467, name: 'Carlo (riz) Rizzo', is_agent: true },
-    content: ' set Group as <a target="_blank" href="/groups/17000390475" rel="noreferrer">Application Development</a>',
-    sub_contents: null, created_at: '2026-08-21T23:35:58Z' },
-  { actor: { id: 17004293882, name: 'Greg Feigenbaum' },
-    content: 'created ticket,  set workspace as <b>IT</b>, set Status as <b>Open</b>, set Urgency as <b>Low</b>, set Priority as <b>Low</b>, set Department as <a target="_blank" href="/itil/departments/17000250186" rel="noreferrer">Agency Growth Team</a>, set Source as <b>Email</b>, set Group as <a target="_blank" href="/groups/17000367080" rel="noreferrer">Help Desk Team</a>, set Type as <b>Incident</b> and set Impact as <b>Low</b>',
-    sub_contents: ['System executed <a>Default SLA Policy</a> (SLA)'], created_at: '2026-08-21T23:08:17Z' },
-];
-
-const HD_GROUP_ID = 17000367080;
-
-test('R. extractGroupHistory parses real activity content oldest-first, ignoring non-group entries', () => {
-  const history = extractGroupHistory(REAL_ACTIVITIES_SAMPLE);
-  assert.deepEqual(history.map(h => h.groupId), [17000367080, 17000390475]);
-  assert.deepEqual(history.map(h => h.groupName), ['Help Desk Team', 'Application Development']);
-  assert.equal(history[0].at, '2026-08-21T23:08:17Z');
-});
-
-test('R2. classifyRouting flags a real HD-to-elsewhere ticket as routedOut', () => {
-  const result = classifyRouting(REAL_ACTIVITIES_SAMPLE, HD_GROUP_ID);
-  assert.equal(result.startedInHD, true);
-  assert.equal(result.routedOut, true);
-  assert.equal(result.currentGroupId, 17000390475);
-  assert.equal(result.currentGroupName, 'Application Development');
-  assert.equal(result.hops, 2);
-});
-
-test('R3. classifyRouting is not routedOut for a ticket that started and stayed in HD', () => {
-  const activities = [
-    { content: 'created ticket, set Group as <a href="/groups/17000367080">Help Desk Team</a>', created_at: '2026-01-01T00:00:00Z' },
-  ];
-  const result = classifyRouting(activities, HD_GROUP_ID);
-  assert.equal(result.startedInHD, true);
-  assert.equal(result.routedOut, false);
-});
-
-test('R4. classifyRouting is not routedOut for a ticket that never touched HD', () => {
-  const activities = [
-    { content: 'created ticket, set Group as <a href="/groups/999">Some Other Team</a>', created_at: '2026-01-01T00:00:00Z' },
-  ];
-  const result = classifyRouting(activities, HD_GROUP_ID);
-  assert.equal(result.startedInHD, false);
-  assert.equal(result.routedOut, false);
-});
-
-test('R5. classifyRouting returns null when the activity log has no group-assignment event at all', () => {
-  const activities = [{ content: 'replied to someone@example.com', created_at: '2026-01-01T00:00:00Z' }];
-  assert.equal(classifyRouting(activities, HD_GROUP_ID), null);
-});
-
-test('S. extractRoutingCandidates keeps only non-HD tickets on/after WINDOW_START', () => {
-  const raw = [
-    { id: 1, group_id: HD_GROUP_ID, created_at: '2025-06-01T00:00:00Z' },      // HD -- excluded
-    { id: 2, group_id: 999, created_at: '2025-06-01T00:00:00Z' },              // candidate
-    { id: 3, group_id: 999, created_at: '2024-01-01T00:00:00Z' },              // pre-cutoff -- excluded
-  ];
-  const candidates = extractRoutingCandidates(raw);
-  assert.deepEqual(candidates.map(c => c.id), [2]);
-});
-
-test('T. fetchTicketActivities follows Link-header pagination', async () => {
-  const calls = [];
-  const client = {
-    async get(url, config) {
-      calls.push(config.params.page);
-      if (config.params.page === 1) {
-        return { data: { activities: [{ content: 'a', created_at: 'x' }] }, headers: { link: '<...>; rel="next"' } };
-      }
-      return { data: { activities: [{ content: 'b', created_at: 'y' }] }, headers: {} };
-    },
-  };
-  const activities = await fetchTicketActivities(123, { client, sleep: () => Promise.resolve() });
-  assert.deepEqual(calls, [1, 2]);
-  assert.equal(activities.length, 2);
-});
-
-test('U. updateRoutingHistory only checks unchecked candidates, respecting the budget', async () => {
-  const candidates = [
-    { id: 1, group_id: 999, created_at: '2025-06-01T00:00:00Z' },
-    { id: 2, group_id: 999, created_at: '2025-06-02T00:00:00Z' },
-    { id: 3, group_id: 999, created_at: '2025-06-03T00:00:00Z' },
-  ];
-  const checked = { 1: { routedOut: false, checkedAt: 'already-done' } };
-  const client = {
-    async get(url) {
-      const id = +url.match(/tickets\/(\d+)/)[1];
-      return { data: { activities: [{ content: `created ticket, set Group as <a href="/groups/${HD_GROUP_ID}">Help Desk Team</a>`, created_at: '2025-06-01T00:00:00Z' }] }, headers: {} };
-    },
-  };
-  const updated = await updateRoutingHistory(candidates, checked, { budget: 1, client, sleep: () => Promise.resolve() });
-  // ticket 1 already checked (untouched), and only 1 of the 2 unchecked (2, 3) processed due to budget
-  assert.equal(updated[1].checkedAt, 'already-done');
-  const newlyChecked = [2, 3].filter(id => updated[id]);
-  assert.equal(newlyChecked.length, 1);
-});
-
-test('U2. updateRoutingHistory logs and skips a failed lookup rather than throwing', async () => {
-  const candidates = [{ id: 1, group_id: 999, created_at: '2025-06-01T00:00:00Z' }];
-  const client = { async get() { throw new Error('boom'); } };
-  const updated = await updateRoutingHistory(candidates, {}, { budget: 10, client, sleep: () => Promise.resolve(), maxRetries: 0 });
-  assert.equal(updated[1], undefined);
 });

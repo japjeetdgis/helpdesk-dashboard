@@ -1,6 +1,10 @@
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { fetchAllTickets, pageTickets, nextDelayMs, mergeTickets, projectTicket, calcStats, buildHTML, getDays, getWeeks, listMonths, trendBadge } = require('./generate-dashboard.js');
+const {
+  fetchAllTickets, pageTickets, nextDelayMs, mergeTickets, projectTicket, calcStats, buildHTML, getDays, getWeeks, listMonths, trendBadge,
+  buildQuarterlyVolume, yoyQuarterDelta,
+  extractRoutingCandidates, extractGroupHistory, classifyRouting, fetchTicketActivities, updateRoutingHistory,
+} = require('./generate-dashboard.js');
 
 const HD_GROUP = 17000367080;
 const noSleep = () => Promise.resolve();
@@ -243,16 +247,21 @@ test('K. buildHTML renders the current month and full history dynamically', () =
 
 // --- incremental sync -------------------------------------------------------
 
-test('L. projectTicket keeps only the non-PII metric fields', () => {
+test('L. projectTicket keeps only the non-PII metric fields plus requester_id', () => {
   const p = projectTicket({
     id: 1, group_id: HD_GROUP, created_at: 'c', status: 2, fr_escalated: false, is_escalated: false,
     subject: 'SECRET', description_text: 'PII', requester_id: 42,
     stats: { first_responded_at: 'a', resolved_at: 'b', closed_at: 'd', agent_responded_at: 'drop' },
   });
-  assert.deepEqual(Object.keys(p).sort(), ['created_at', 'fr_escalated', 'group_id', 'id', 'is_escalated', 'stats', 'status']);
+  assert.deepEqual(Object.keys(p).sort(), ['created_at', 'fr_escalated', 'group_id', 'id', 'is_escalated', 'requester_id', 'stats', 'status']);
   assert.equal(p.subject, undefined);
-  assert.equal(p.requester_id, undefined);
+  assert.equal(p.requester_id, 42);
   assert.deepEqual(Object.keys(p.stats).sort(), ['closed_at', 'first_responded_at', 'resolved_at']);
+});
+
+test('L3. projectTicket defaults requester_id to null when absent', () => {
+  const p = projectTicket({ id: 1, group_id: HD_GROUP, created_at: 'c', status: 2, fr_escalated: false, is_escalated: false });
+  assert.equal(p.requester_id, null);
 });
 
 test('M. mergeTickets upserts changed HD tickets, adds new, drops moved-out and pre-cutoff', () => {
@@ -332,4 +341,308 @@ test('Q4. trendBadge falls back gracefully with no prior data', () => {
   const t = trendBadge(5, null, 'July 2026');
   assert.equal(t.cardCls, 'amber');
   assert.match(t.text, /No trend data/);
+});
+
+// --- quarterly volume (YoY check) --------------------------------------
+
+test('R. buildQuarterlyVolume flags Q1 as no-data and Q2 as partial before a mid-quarter windowStart', () => {
+  const now = new Date('2025-12-15T00:00:00Z');
+  const windowStart = new Date('2025-06-01T00:00:00Z');
+  const tickets = [
+    { created_at: '2025-06-10T00:00:00Z', requester_id: 1 },
+    { created_at: '2025-07-01T00:00:00Z', requester_id: 2 },
+    { created_at: '2025-10-01T00:00:00Z', requester_id: 3 },
+  ];
+  const q = buildQuarterlyVolume(tickets, 2025, now, windowStart);
+  const byLabel = Object.fromEntries(q.map(x => [x.label, x]));
+  assert.equal(byLabel['2025 Q1'].coverage, 'none');
+  assert.equal(byLabel['2025 Q1'].total, 0);
+  assert.equal(byLabel['2025 Q2'].coverage, 'partial');
+  assert.equal(byLabel['2025 Q2'].total, 1);
+  assert.equal(byLabel['2025 Q3'].coverage, 'full');
+  assert.equal(byLabel['2025 Q3'].total, 1);
+  assert.equal(byLabel['2025 Q4'].total, 1);
+});
+
+test('R2. buildQuarterlyVolume stops at the current quarter and marks full-quarter coverage after windowStart', () => {
+  const now = new Date('2025-11-01T00:00:00Z');
+  const windowStart = new Date('2025-06-01T00:00:00Z');
+  const q = buildQuarterlyVolume([], 2025, now, windowStart);
+  assert.deepEqual(q.map(x => x.label), ['2025 Q1', '2025 Q2', '2025 Q3', '2025 Q4']);
+  assert.equal(q.find(x => x.label === '2025 Q3').coverage, 'full');
+  assert.equal(q.find(x => x.label === '2025 Q4').coverage, 'full');
+});
+
+test('R3. buildQuarterlyVolume marks a quarter pendingResync when some cached tickets lack requester_id', () => {
+  const now = new Date('2025-12-15T00:00:00Z');
+  const tickets = [
+    { created_at: '2025-10-01T00:00:00Z', requester_id: 1 },
+    { created_at: '2025-10-05T00:00:00Z' }, // pre-existing cached row, no requester_id key at all
+  ];
+  const q4 = buildQuarterlyVolume(tickets, 2025, now).find(x => x.label === '2025 Q4');
+  assert.equal(q4.total, 2);
+  assert.equal(q4.pendingResync, true);
+  assert.equal(q4.requesters, 1);
+});
+
+test('R4. buildQuarterlyVolume dedupes requesters within a quarter', () => {
+  const now = new Date('2025-12-15T00:00:00Z');
+  const tickets = [
+    { created_at: '2025-10-01T00:00:00Z', requester_id: 7 },
+    { created_at: '2025-10-05T00:00:00Z', requester_id: 7 },
+    { created_at: '2025-10-08T00:00:00Z', requester_id: 8 },
+  ];
+  const q4 = buildQuarterlyVolume(tickets, 2025, now).find(x => x.label === '2025 Q4');
+  assert.equal(q4.total, 3);
+  assert.equal(q4.requesters, 2);
+  assert.equal(q4.pendingResync, false);
+});
+
+test('R5. buildQuarterlyVolume flags only the quarter containing now as isCurrent', () => {
+  const now = new Date('2026-08-24T00:00:00Z');
+  const q = buildQuarterlyVolume([], 2026, now);
+  assert.deepEqual(q.map(x => [x.label, x.isCurrent]), [
+    ['2026 Q1', false], ['2026 Q2', false], ['2026 Q3', true],
+  ]);
+});
+
+test('R6. yoyQuarterDelta computes %-change vs the same quarter one year earlier', () => {
+  const quarters = [
+    ...buildQuarterlyVolume([
+      { created_at: '2025-08-01T00:00:00Z', requester_id: 1 },
+      { created_at: '2025-08-02T00:00:00Z', requester_id: 2 },
+    ], 2025, new Date('2025-12-01T00:00:00Z')),
+    ...buildQuarterlyVolume([
+      { created_at: '2026-08-01T00:00:00Z', requester_id: 1 },
+      { created_at: '2026-08-02T00:00:00Z', requester_id: 2 },
+      { created_at: '2026-08-03T00:00:00Z', requester_id: 3 },
+    ], 2026, new Date('2026-12-01T00:00:00Z')),
+  ];
+  const q3_2026 = quarters.find(x => x.label === '2026 Q3');
+  assert.equal(yoyQuarterDelta(quarters, q3_2026), 50);
+  const q3_2025 = quarters.find(x => x.label === '2025 Q3');
+  assert.equal(yoyQuarterDelta(quarters, q3_2025), null, 'no prior-year quarter tracked yet');
+});
+
+// --- buildHTML: quarterly volume + cross-group routing sections -------------
+
+test('S. buildHTML renders the Quarterly ticket volume chart when quarterlyVolume is provided', () => {
+  const html = buildHTML({
+    monthly: { 'Jun 2026': calcStats([]) },
+    months: [{ key: 'Jun 2026', long: 'June 2026', isCurrent: true }],
+    current: { key: 'Jun 2026', long: 'June 2026' },
+    weekly: [], days: [], overall: calcStats([]), updated: 'x',
+    quarterlyVolume: buildQuarterlyVolume([], 2026, new Date('2026-06-18T00:00:00Z')),
+  });
+  assert.match(html, /Quarterly ticket volume/);
+  assert.match(html, /id="qtyChart"/);
+});
+
+test('S2. buildHTML omits the Quarterly ticket volume section when quarterlyVolume is empty', () => {
+  const html = buildHTML({
+    monthly: { 'Jun 2026': calcStats([]) },
+    months: [{ key: 'Jun 2026', long: 'June 2026', isCurrent: true }],
+    current: { key: 'Jun 2026', long: 'June 2026' },
+    weekly: [], days: [], overall: calcStats([]), updated: 'x',
+  });
+  assert.doesNotMatch(html, /Quarterly ticket volume/);
+});
+
+test('T. buildHTML renders the Cross-group routing section when routingSummary is provided', () => {
+  const html = buildHTML({
+    monthly: { 'Jun 2026': calcStats([]) },
+    months: [{ key: 'Jun 2026', long: 'June 2026', isCurrent: true }],
+    current: { key: 'Jun 2026', long: 'June 2026' },
+    weekly: [], days: [], overall: calcStats([]), updated: 'x',
+    routingSummary: { totalCandidates: 40, totalChecked: 10, routedOutCount: 3, byDestGroup: [{ groupName: 'Application Development', count: 3, pct: 100 }] },
+  });
+  assert.match(html, /Cross-group routing/);
+  assert.match(html, /Application Development/);
+  assert.match(html, /30 candidates are still unchecked/);
+  assert.match(html, /% of routed-out tickets/);
+  assert.match(html, /100\.0%/);
+});
+
+test('T2. routingSummary.byDestGroup entries carry a percentage of routed-out tickets that sums to ~100%', () => {
+  const html = buildHTML({
+    monthly: { 'Jun 2026': calcStats([]) },
+    months: [{ key: 'Jun 2026', long: 'June 2026', isCurrent: true }],
+    current: { key: 'Jun 2026', long: 'June 2026' },
+    weekly: [], days: [], overall: calcStats([]), updated: 'x',
+    routingSummary: {
+      totalCandidates: 40, totalChecked: 40, routedOutCount: 10,
+      byDestGroup: [
+        { groupName: 'Application Development', count: 7, pct: 70 },
+        { groupName: 'Security', count: 3, pct: 30 },
+      ],
+    },
+  });
+  assert.match(html, /Application Development<\/td><td class="r">7<\/td><td class="r">70\.0%/);
+  assert.match(html, /Security<\/td><td class="r">3<\/td><td class="r">30\.0%/);
+});
+
+test('T3. buildHTML omits the Cross-group routing section when routingSummary is absent', () => {
+  const html = buildHTML({
+    monthly: { 'Jun 2026': calcStats([]) },
+    months: [{ key: 'Jun 2026', long: 'June 2026', isCurrent: true }],
+    current: { key: 'Jun 2026', long: 'June 2026' },
+    weekly: [], days: [], overall: calcStats([]), updated: 'x',
+  });
+  assert.doesNotMatch(html, /Cross-group routing/);
+});
+
+// --- cross-group routing (classification) -----------------------------------
+
+// Real GET /tickets/{id}/activities response fetched via a personal/admin
+// session, captured 2026-08-24: HTML-formatted content, a ticket created
+// directly into Help Desk Team (17000367080), later reassigned to
+// Application Development (17000390475). Activities come back newest-first.
+const REAL_ACTIVITIES_SAMPLE_HTML = [
+  { actor: { id: 17002306467, name: 'Carlo (riz) Rizzo', is_agent: true },
+    content: ' set Group as <a target="_blank" href="/groups/17000390475" rel="noreferrer">Application Development</a>',
+    sub_contents: null, created_at: '2026-08-21T23:35:58Z' },
+  { actor: { id: 17004293882, name: 'Greg Feigenbaum' },
+    content: 'created ticket,  set workspace as <b>IT</b>, set Status as <b>Open</b>, set Urgency as <b>Low</b>, set Priority as <b>Low</b>, set Department as <a target="_blank" href="/itil/departments/17000250186" rel="noreferrer">Agency Growth Team</a>, set Source as <b>Email</b>, set Group as <a target="_blank" href="/groups/17000367080" rel="noreferrer">Help Desk Team</a>, set Type as <b>Incident</b> and set Impact as <b>Low</b>',
+    sub_contents: ['System executed <a>Default SLA Policy</a> (SLA)'], created_at: '2026-08-21T23:08:17Z' },
+];
+
+// Real response for the SAME kind of ticket, but fetched with the actual
+// GitHub Actions service API key, captured 2026-08-25: plain text, no markup
+// at all -- this is what production actually receives. This ticket was
+// created directly into Accounts Payable and never touched Help Desk.
+const REAL_ACTIVITIES_SAMPLE_PLAINTEXT = [
+  { actor: { id: 17003947443, name: 'Sheree Jenerette', is_agent: true },
+    content: ' set Status as Resolved, set Category as Accounts Payable, set Department as Agency Growth Team and set Sub Category as Invoice processing',
+    sub_contents: null, created_at: '2026-08-24T12:50:44Z' },
+  { actor: { id: 0, name: 'Ticket Workflow', is_agent_deleted: true },
+    content: ' executed Skip Initial Assignment Notification for Help Desk workflow from Ticket is raised event',
+    sub_contents: ['Sent email to group Accounts Payable', 'Workflow Ends'], created_at: '2026-08-22T14:45:10Z' },
+  { actor: { id: 17003438253, name: 'Intuit E-Commerce Service' },
+    content: 'created ticket,  set workspace as IT, set Status as Open, set Urgency as Low, set Priority as Low, set Source as Email, set Group as Accounts Payable, set Type as Incident and set Impact as Low',
+    sub_contents: ['System executed Default SLA Policy (SLA)'], created_at: '2026-08-22T14:45:09Z' },
+];
+
+test('U. extractGroupHistory parses real HTML activity content oldest-first, ignoring non-group entries', () => {
+  const history = extractGroupHistory(REAL_ACTIVITIES_SAMPLE_HTML);
+  assert.deepEqual(history.map(h => h.groupId), [17000367080, 17000390475]);
+  assert.deepEqual(history.map(h => h.groupName), ['Help Desk Team', 'Application Development']);
+  assert.equal(history[0].at, '2026-08-21T23:08:17Z');
+});
+
+test('U2. extractGroupHistory parses real plain-text activity content (no group id available)', () => {
+  const history = extractGroupHistory(REAL_ACTIVITIES_SAMPLE_PLAINTEXT);
+  assert.deepEqual(history, [{ groupId: null, groupName: 'Accounts Payable', at: '2026-08-22T14:45:09Z' }]);
+});
+
+test('V. classifyRouting flags a real HD-to-elsewhere ticket as routedOut (HTML log, current group from the ticket record)', () => {
+  const result = classifyRouting(REAL_ACTIVITIES_SAMPLE_HTML, HD_GROUP, 'Help Desk Team', 17000390475, 'Application Development');
+  assert.equal(result.startedInHD, true);
+  assert.equal(result.routedOut, true);
+  assert.equal(result.currentGroupId, 17000390475);
+  assert.equal(result.currentGroupName, 'Application Development');
+  assert.equal(result.hops, 2);
+});
+
+test('V2. classifyRouting matches a plain-text origin by name and correctly says this ticket never touched HD', () => {
+  const result = classifyRouting(REAL_ACTIVITIES_SAMPLE_PLAINTEXT, HD_GROUP, 'Help Desk Team', 17000384749, 'Accounts Payable');
+  assert.equal(result.startedInHD, false);
+  assert.equal(result.routedOut, false);
+  assert.equal(result.currentGroupId, 17000384749);
+  assert.equal(result.currentGroupName, 'Accounts Payable');
+});
+
+test('V3. classifyRouting is not routedOut for a ticket that started and stayed in HD', () => {
+  const activities = [
+    { content: 'created ticket, set Group as Help Desk Team', created_at: '2026-01-01T00:00:00Z' },
+  ];
+  const result = classifyRouting(activities, HD_GROUP, 'Help Desk Team', HD_GROUP, 'Help Desk Team');
+  assert.equal(result.startedInHD, true);
+  assert.equal(result.routedOut, false);
+});
+
+test('V4. classifyRouting is not routedOut for a ticket that never touched HD', () => {
+  const activities = [
+    { content: 'created ticket, set Group as Some Other Team', created_at: '2026-01-01T00:00:00Z' },
+  ];
+  const result = classifyRouting(activities, HD_GROUP, 'Help Desk Team', 999, 'Some Other Team');
+  assert.equal(result.startedInHD, false);
+  assert.equal(result.routedOut, false);
+});
+
+test('V5. classifyRouting returns null when the activity log has no group-assignment event at all', () => {
+  const activities = [{ content: 'replied to someone@example.com', created_at: '2026-01-01T00:00:00Z' }];
+  assert.equal(classifyRouting(activities, HD_GROUP, 'Help Desk Team', 999, 'Some Other Team'), null);
+});
+
+test('V6. classifyRouting trusts the passed-in current group over anything parsed from text (a bulk/API move with no matching activity text)', () => {
+  const activities = [
+    { content: 'created ticket, set Group as Help Desk Team', created_at: '2026-01-01T00:00:00Z' },
+  ];
+  const result = classifyRouting(activities, HD_GROUP, 'Help Desk Team', 999, 'Some Other Team');
+  assert.equal(result.startedInHD, true);
+  assert.equal(result.currentGroupId, 999);
+  assert.equal(result.routedOut, true);
+});
+
+test('W. extractRoutingCandidates keeps only non-HD tickets on/after WINDOW_START', () => {
+  const raw = [
+    { id: 1, group_id: HD_GROUP, created_at: '2025-06-01T00:00:00Z' },      // HD -- excluded
+    { id: 2, group_id: 999, created_at: '2025-06-01T00:00:00Z' },           // candidate
+    { id: 3, group_id: 999, created_at: '2024-01-01T00:00:00Z' },           // pre-cutoff -- excluded
+  ];
+  const candidates = extractRoutingCandidates(raw);
+  assert.deepEqual(candidates.map(c => c.id), [2]);
+});
+
+test('X. fetchTicketActivities follows Link-header pagination', async () => {
+  const calls = [];
+  const client = {
+    async get(url, config) {
+      calls.push(config.params.page);
+      if (config.params.page === 1) {
+        return { data: { activities: [{ content: 'a', created_at: 'x' }] }, headers: { link: '<...>; rel="next"' } };
+      }
+      return { data: { activities: [{ content: 'b', created_at: 'y' }] }, headers: {} };
+    },
+  };
+  const activities = await fetchTicketActivities(123, { client, sleep: () => Promise.resolve() });
+  assert.deepEqual(calls, [1, 2]);
+  assert.equal(activities.length, 2);
+});
+
+test('Y. updateRoutingHistory only checks unchecked candidates, respecting the budget', async () => {
+  const candidates = [
+    { id: 1, group_id: 999, created_at: '2025-06-01T00:00:00Z' },
+    { id: 2, group_id: 999, created_at: '2025-06-02T00:00:00Z' },
+    { id: 3, group_id: 999, created_at: '2025-06-03T00:00:00Z' },
+  ];
+  const checked = { 1: { routedOut: false, checkedAt: 'already-done' } };
+  const client = {
+    async get() {
+      return { data: { activities: [{ content: `created ticket, set Group as <a href="/groups/${HD_GROUP}">Help Desk Team</a>`, created_at: '2025-06-01T00:00:00Z' }] }, headers: {} };
+    },
+  };
+  const updated = await updateRoutingHistory(candidates, checked, { budget: 1, client, sleep: () => Promise.resolve() });
+  assert.equal(updated[1].checkedAt, 'already-done');
+  const newlyChecked = [2, 3].filter(id => updated[id]);
+  assert.equal(newlyChecked.length, 1);
+});
+
+test('Y2. updateRoutingHistory logs and skips a failed lookup rather than throwing', async () => {
+  const candidates = [{ id: 1, group_id: 999, created_at: '2025-06-01T00:00:00Z' }];
+  const client = { async get() { throw new Error('boom'); } };
+  const updated = await updateRoutingHistory(candidates, {}, { budget: 10, client, sleep: () => Promise.resolve(), maxRetries: 0 });
+  assert.equal(updated[1], undefined);
+});
+
+test('Y3. updateRoutingHistory end-to-end on the real plain-text sample: matches origin by name, current group from the candidate record', async () => {
+  const candidates = [{ id: 165177, group_id: 17000384749, created_at: '2026-08-22T14:45:09Z' }];
+  const client = { async get() { return { data: { activities: REAL_ACTIVITIES_SAMPLE_PLAINTEXT }, headers: {} }; } };
+  const groupNamesById = new Map([[17000384749, 'Accounts Payable'], [HD_GROUP, 'Help Desk Team']]);
+  const updated = await updateRoutingHistory(candidates, {}, {
+    budget: 10, client, sleep: () => Promise.resolve(), hdGroupName: 'Help Desk Team', groupNamesById,
+  });
+  assert.equal(updated[165177].startedInHD, false);
+  assert.equal(updated[165177].routedOut, false);
+  assert.equal(updated[165177].currentGroupName, 'Accounts Payable');
 });

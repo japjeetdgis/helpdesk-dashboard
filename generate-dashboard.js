@@ -77,11 +77,16 @@ async function withRetry(fn, { sleep, maxRetries, label }) {
 
 // Minimal, non-PII projection of a Freshservice ticket — only the fields the
 // metrics need. This is what we persist to STATE_FILE (a public repo), so it
-// must never carry subjects, descriptions, or requester info.
+// must never carry subjects, descriptions, or free-text requester info.
+// `requester_id` (an internal numeric employee id, not PII by itself) was
+// added for the quarterly distinct-requester chart -- tickets cached before
+// this change lack the field entirely; see `buildQuarterlyVolume`'s
+// pendingResync handling, which needs a fresh full backfill to clear.
 function projectTicket(t) {
   return {
     id: t.id,
     group_id: t.group_id,
+    requester_id: t.requester_id ?? null,
     created_at: t.created_at,
     status: t.status,
     fr_escalated: t.fr_escalated,
@@ -181,20 +186,53 @@ async function pageTickets(sinceISO, opts = {}) {
   return all;
 }
 
-// Full scan of the data window (DATA_START → now). Used for the first
-// backfill and the periodic reconcile; returns projected HD tickets,
-// replacing any prior set. maxPages defaults higher than pageTickets' own
-// default (550) because this pages across ALL Freshservice groups, not just
-// HD -- hit that ceiling on the sibling helpdesk-dashboard-analyst repo after
-// extending its window similarly; raise further here if it happens again.
-async function fetchAllTickets(opts = {}) {
-  const raw = await pageTickets(DATA_START, { maxPages: 1500, ...opts, stopAtCutoff: true });
-  const hd = raw
+// Full scan of the data window (DATA_START → now), across ALL Freshservice
+// groups (not just HD) -- the routing-candidate mining below needs the
+// non-HD rows too, so this is kept separate from the HD-only filter.
+// maxPages defaults higher than pageTickets' own default (550) because of
+// that all-groups scope -- hit that ceiling on the sibling
+// helpdesk-dashboard-analyst repo after extending its window similarly;
+// raise further here if it happens again.
+async function fetchAllTicketsRaw(opts = {}) {
+  return pageTickets(DATA_START, { maxPages: 1500, ...opts, stopAtCutoff: true });
+}
+
+function filterHdTickets(raw) {
+  return raw
     .filter(t => t.group_id === HD_GROUP && new Date(t.created_at) >= WINDOW_START)
     .map(projectTicket);
+}
+
+// Used for the first backfill and the periodic reconcile; returns projected
+// HD tickets, replacing any prior set.
+async function fetchAllTickets(opts = {}) {
+  const raw = await fetchAllTicketsRaw(opts);
+  const hd = filterHdTickets(raw);
   console.log(`Backfill complete — ${hd.length} HD tickets`);
   if (hd.length === 0) throw new Error('Zero HD tickets fetched — API returned no data. Check API key and group ID.');
   return hd;
+}
+
+// Paged fetch of the Freshservice group directory (support groups/boards) --
+// needed to resolve a routing candidate's current group name, and to give
+// classifyRouting HD's real display name for its plain-text-log fallback match.
+async function fetchGroups(opts = {}) {
+  const { client = axios, sleep = realSleep, maxRetries = 3, maxPages = 20 } = opts;
+  const all = [];
+  let page = 1;
+  while (page <= maxPages) {
+    const res = await withRetry(
+      () => client.get(`${baseURL}/groups`, { auth, params: { per_page: 100, page } }),
+      { sleep, maxRetries, label: `groups page ${page}` }
+    );
+    const groups = res.data.groups || [];
+    all.push(...groups);
+    if (groups.length < 100) break;
+    page++;
+    await sleep(nextDelayMs(res.headers));
+  }
+  console.log(`Fetched ${all.length} groups`);
+  return all;
 }
 
 // Upsert a raw delta into the stored (projected) set, keyed by ticket id.
@@ -221,6 +259,142 @@ function saveState(state) {
   fs.writeFileSync(STATE_FILE, JSON.stringify(state));
 }
 
+// --- cross-group routing (did a ticket start in HD and get moved out?) -----
+//
+// Freshservice's ticket-list API only ever shows a ticket's *current* group --
+// once a ticket leaves HD it silently disappears from the HD dataset with no
+// trace it was ever here. Recovering that requires the per-ticket Activities
+// log (GET /tickets/{id}/activities), which is one API call per ticket, so
+// this builds up gradually across many runs rather than all at once.
+
+const ROUTING_FILE = process.env.ROUTING_FILE || 'routing-history.json'; // persisted cache, committed to the repo
+// Tickets checked per run. Pacing is still governed by nextDelayMs (30% of
+// the live rate limit), so raising this just means a longer-running job, not
+// a harder hit on the shared API budget.
+const ROUTING_CHECK_BUDGET = 1000;
+
+// Freshservice logs every group assignment (including the one at ticket
+// creation) as free-text activity content, not a structured old/new-group
+// field, and the exact rendering differs by session type:
+//   set Group as <a ... href="/groups/17000390475" ...>Application Development</a>   (HTML, personal/admin session)
+//   set Group as Application Development                                             (plain text, service API key -- what production actually receives)
+// This regex matches either form; the plain-text branch only recovers the
+// group NAME (no id -- there's nothing to parse it from), which is why
+// classifyRouting below matches the origin group by name as a fallback, and
+// gets the *current* group from the ticket record itself rather than by
+// parsing "the last group mentioned" out of free text.
+const GROUP_ACTIVITY_RE = /set Group as (?:<a[^>]*href="\/groups\/(\d+)"[^>]*>([^<]*)<\/a>|([^,<]+?)(?=,| and |$))/;
+
+// Activities come back newest-first; this returns them oldest-first so
+// index 0 is the ticket's very first group (usually its creation group).
+// Entries with no group-assignment phrase (replies, notes, workflow log
+// entries, etc.) are skipped. `groupId` is null for a plain-text match --
+// the name is still captured.
+function extractGroupHistory(activities) {
+  return [...activities].reverse()
+    .map(a => {
+      const m = a.content && a.content.match(GROUP_ACTIVITY_RE);
+      if (!m) return null;
+      const groupId = m[1] ? +m[1] : null;
+      const groupName = (m[2] ?? m[3] ?? '').trim();
+      return groupName ? { groupId, groupName, at: a.created_at } : null;
+    })
+    .filter(Boolean);
+}
+
+const normalizeGroupName = s => (s || '').trim().toLowerCase();
+
+// Returns null when the activity log has no group-assignment event at all --
+// i.e. no verdict on the *origin* group. The *current* group is never parsed
+// from text: it's passed in directly from the ticket's own current
+// group_id/name (always reliable), since a plain-text log has no id to parse
+// and a reassignment that didn't generate a "set Group as" activity at all
+// (e.g. a bulk/API move) would otherwise make stale parsed text look
+// authoritative.
+function classifyRouting(activities, hdGroupId, hdGroupName, currentGroupId, currentGroupName) {
+  const history = extractGroupHistory(activities);
+  if (!history.length) return null;
+  const first = history[0];
+  const startedInHD = (first.groupId != null && first.groupId === hdGroupId)
+    || (hdGroupName && normalizeGroupName(first.groupName) === normalizeGroupName(hdGroupName));
+  return {
+    startedInHD, currentGroupId, currentGroupName,
+    routedOut: startedInHD && currentGroupId !== hdGroupId,
+    hops: history.length,
+  };
+}
+
+// Non-HD tickets are candidates for the routing-history check -- did this
+// ticket pass through HD before landing in its current group? Minimal
+// projection only; the activities lookup itself is what actually resolves
+// whether HD was ever involved.
+function extractRoutingCandidates(raw) {
+  return raw
+    .filter(t => t.group_id !== HD_GROUP && new Date(t.created_at) >= WINDOW_START)
+    .map(t => ({ id: t.id, group_id: t.group_id, created_at: t.created_at }));
+}
+
+// Freshservice paginates list-ish endpoints via a `Link` response header
+// (rel="next") rather than a total-count field. Most tickets' activity logs
+// are short enough to fit on one page; this follows Link only if present,
+// so it's safe even if this endpoint turns out not to paginate that way.
+async function fetchTicketActivities(ticketId, opts = {}) {
+  const { client = axios, sleep = realSleep, maxRetries = 3 } = opts;
+  let all = [];
+  let page = 1;
+  for (;;) {
+    const res = await withRetry(
+      () => client.get(`${baseURL}/tickets/${ticketId}/activities`, { auth, params: { page } }),
+      { sleep, maxRetries, label: `activities ${ticketId} page ${page}` }
+    );
+    all = all.concat(res.data.activities || []);
+    await sleep(nextDelayMs(res.headers));
+    const link = res.headers?.link || res.headers?.Link;
+    if (!link || !link.includes('rel="next"')) break;
+    page++;
+  }
+  return all;
+}
+
+function loadRoutingState() {
+  try {
+    const s = JSON.parse(fs.readFileSync(ROUTING_FILE, 'utf8'));
+    if (s && Array.isArray(s.candidates) && s.checked && typeof s.checked === 'object') return s;
+  } catch { /* missing or corrupt → start fresh */ }
+  return { candidates: [], checked: {} };
+}
+
+function saveRoutingState(state) {
+  fs.writeFileSync(ROUTING_FILE, JSON.stringify(state));
+}
+
+// Checks up to `budget` not-yet-checked candidates this run and returns an
+// updated `checked` map. A per-ticket fetch failure is logged and skipped
+// (left unchecked for a future run) rather than aborting the whole run --
+// this is supplementary data, not the core ticket sync.
+// `hdGroupName`/`groupNamesById` let the origin-group match fall back to a
+// name comparison when the activity log is plain text (no group id to
+// parse), and let the *current* group be labeled without trusting anything
+// parsed from that same text.
+async function updateRoutingHistory(candidates, checked, opts = {}) {
+  const { budget = ROUTING_CHECK_BUDGET, client, sleep = realSleep, hdGroupName = null, groupNamesById = new Map() } = opts;
+  const unchecked = candidates.filter(c => !checked[c.id]);
+  const batch = unchecked.slice(0, budget);
+  console.log(`Routing check: ${batch.length}/${unchecked.length} unchecked candidates this run (${Object.keys(checked).length} already known)`);
+  const updated = { ...checked };
+  for (const c of batch) {
+    try {
+      const activities = await fetchTicketActivities(c.id, { client, sleep });
+      const currentGroupName = groupNamesById.get(c.group_id) || null;
+      const result = classifyRouting(activities, HD_GROUP, hdGroupName, c.group_id, currentGroupName);
+      updated[c.id] = { ...result, group_id: c.group_id, created_at: c.created_at, checkedAt: new Date().toISOString() };
+    } catch (e) {
+      console.warn(`  Activities lookup failed for ticket ${c.id}: ${e.message} — will retry next run`);
+    }
+  }
+  return updated;
+}
+
 function calcStats(tickets) {
   const res = tickets.filter(t => t.status===4||t.status===5);
   // First-response and resolution times live in the embedded `stats` object
@@ -243,6 +417,47 @@ function calcStats(tickets) {
     frtToRes:avgFRT&&avgTTR?+(avgTTR-avgFRT).toFixed(1):null,
     fcr:res.length?+(res.filter(t=>t.fr_escalated===false).length/res.length*100).toFixed(1):0
   };
+}
+
+// Quarterly ticket volume + distinct requester count for one calendar year —
+// built for a YoY volume sanity check with leadership. Flags two data-quality
+// traps rather than silently rendering misleading numbers:
+//   - `coverage`: this dashboard's ticket history starts at WINDOW_START
+//     (DATA_START). A quarter entirely before that has 'none' data; one
+//     straddling it has 'partial' data — both will read artificially low
+//     compared to a real full quarter.
+//   - `pendingResync`: `requester_id` was added to the ticket projection after
+//     tickets.json already had cached rows without it. Those older rows are
+//     only backfilled by the next full resync (every FULL_RESYNC_DAYS), so a
+//     quarter mixing old + new rows gets a '+' suffix rather than a bare
+//     (undercounted) number.
+function buildQuarterlyVolume(tickets, year, now = new Date(), windowStart = WINDOW_START) {
+  const quarters = [];
+  for (let q = 1; q <= 4; q++) {
+    const qStart = new Date(Date.UTC(year, (q - 1) * 3, 1));
+    const qEnd = new Date(Date.UTC(year, q * 3, 1));
+    if (qStart > now) break;
+    const qTickets = tickets.filter(t => {
+      const c = new Date(t.created_at);
+      return c >= qStart && c < qEnd;
+    });
+    const withRequester = qTickets.filter(t => 'requester_id' in t);
+    const pendingResync = qTickets.length > 0 && withRequester.length < qTickets.length;
+    const requesters = new Set(withRequester.filter(t => t.requester_id != null).map(t => t.requester_id)).size;
+    const coverage = qEnd <= windowStart ? 'none' : qStart < windowStart ? 'partial' : 'full';
+    const isCurrent = now >= qStart && now < qEnd;
+    quarters.push({ label: `${year} Q${q}`, year, quarter: q, total: qTickets.length, requesters, pendingResync, coverage, isCurrent });
+  }
+  return quarters;
+}
+
+// year-over-year %-change for the same quarter number one year earlier, e.g.
+// 2026 Q2 vs 2025 Q2. Returns null when there's no matching prior-year quarter
+// in the set (first tracked year) or the prior quarter had zero tickets.
+function yoyQuarterDelta(quarters, q) {
+  const prior = quarters.find(x => x.year === q.year - 1 && x.quarter === q.quarter);
+  if (!prior || !prior.total) return null;
+  return +((q.total - prior.total) / prior.total * 100).toFixed(1);
 }
 
 function getWeeks(monthTickets, now) {
@@ -279,7 +494,7 @@ function getDays(monthTickets, now) {
 }
 
 function buildHTML(data) {
-  const { monthly, weekly, days, overall, updated, months, current, monthTrend } = data;
+  const { monthly, weekly, days, overall, updated, months, current, monthTrend, quarterlyVolume = [], routingSummary } = data;
   const cur = monthly[current.key] || {};
   const wkColors = ['#2B5CE6','#1A7A52','#9B5DE5','#F15BB5','#00BBF9'];
   const wkLabels = JSON.stringify(weekly.map(w=>w.label));
@@ -332,6 +547,7 @@ h1{font-size:28px;font-weight:600;letter-spacing:-.02em}h1 span{color:#7BA4F5}
 .section-rule{flex:1;height:1px;background:var(--border)}
 .kpi-grid-5{display:grid;grid-template-columns:repeat(5,1fr);gap:12px}
 .kpi-grid-4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.kpi-grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
 .kpi-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px 18px;position:relative;overflow:hidden}
 .kpi-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:var(--border-dark)}
 .kpi-card.green::before{background:var(--green)}.kpi-card.amber::before{background:var(--amber)}.kpi-card.blue::before{background:var(--blue)}
@@ -470,6 +686,89 @@ hr{border:none;border-top:1px solid var(--border);margin:32px 0}
   </div>
 </div>
 
+${quarterlyVolume.length ? `
+<div class="section">
+  <div class="section-header"><span class="section-label">Quarterly ticket volume — YoY volume check</span><div class="section-rule"></div></div>
+  ${(() => {
+    const noneQs = quarterlyVolume.filter(q => q.coverage === 'none').map(q => q.label);
+    const partialQs = quarterlyVolume.filter(q => q.coverage === 'partial').map(q => q.label);
+    if (!noneQs.length && !partialQs.length) return '';
+    const bits = [];
+    if (noneQs.length) bits.push(`${noneQs.join(', ')} ${noneQs.length > 1 ? 'have' : 'has'} zero data`);
+    if (partialQs.length) bits.push(`${partialQs.join(', ')} ${partialQs.length > 1 ? 'reflect' : 'reflects'} a partial quarter`);
+    return `<div class="insight"><strong>Data coverage caveat — read before citing this to leadership:</strong> this dashboard's ticket history only starts ${DATA_START.slice(0,10)}. ${bits.join('; ')} — both will look artificially low next to a real full quarter, which likely explains a "surprisingly low" total for that period. Treat only 'Full quarter' rows as comparable to a full-quarter figure from any other source.</div>`;
+  })()}
+  <div class="chart-card-full">
+    <div class="chart-label">Tickets created &amp; distinct requesters, per quarter</div>
+    <div style="position:relative;height:280px"><canvas id="qtyChart"></canvas></div>
+  </div>
+  <div class="insight">Hover a point for the exact figure — plus its YoY %-change (vs. the same quarter one year earlier), or an "in progress"/"pending resync" note where that number isn't final yet. A hollow point marks the current, still-in-progress quarter — comparing it to a completed quarter would understate its real total.</div>
+</div>
+<script>
+(function(){
+  const qLabels=${JSON.stringify(quarterlyVolume.map(q => q.label))};
+  const qVol=${JSON.stringify(quarterlyVolume.map(q => q.total))};
+  const qReq=${JSON.stringify(quarterlyVolume.map(q => q.requesters))};
+  const qMeta=${JSON.stringify(quarterlyVolume.map(q => ({
+    isCurrent: q.isCurrent,
+    pendingResync: q.pendingResync,
+    yoy: q.isCurrent ? null : yoyQuarterDelta(quarterlyVolume, q),
+  })))};
+  const hollow = base => qMeta.map(m => m.isCurrent ? '#fff' : base);
+  new Chart(document.getElementById('qtyChart'), {
+    type: 'line',
+    data: { labels: qLabels, datasets: [
+      { label: 'Tickets created', data: qVol, borderColor: '#2B5CE6', backgroundColor: '#2B5CE6',
+        pointBackgroundColor: hollow('#2B5CE6'), pointBorderColor: '#2B5CE6', pointBorderWidth: 2,
+        pointRadius: 5, pointHoverRadius: 7, tension: .25, yAxisID: 'y' },
+      { label: 'Distinct requesters', data: qReq, borderColor: '#1A7A52', backgroundColor: '#1A7A52',
+        pointBackgroundColor: hollow('#1A7A52'), pointBorderColor: '#1A7A52', pointBorderWidth: 2,
+        pointRadius: 5, pointHoverRadius: 7, tension: .25, yAxisID: 'y1' },
+    ] },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { position: 'bottom', labels: { boxWidth: 10, font: { size: 10 }, color: '#6B6860' } },
+        tooltip: { callbacks: { label: (ctx) => {
+          const m = qMeta[ctx.dataIndex];
+          if (ctx.datasetIndex === 0) {
+            if (m.isCurrent) return ' Tickets: ' + ctx.raw + ' (in progress)';
+            if (m.yoy != null) return ' Tickets: ' + ctx.raw + ' (' + (m.yoy >= 0 ? '+' : '') + m.yoy + '% YoY)';
+            return ' Tickets: ' + ctx.raw;
+          }
+          if (m.pendingResync) return ' Requesters: ' + ctx.raw + '+ (pending resync)';
+          if (m.isCurrent) return ' Requesters: ' + ctx.raw + ' (in progress)';
+          return ' Requesters: ' + ctx.raw;
+        } } },
+      },
+      scales: {
+        x: { ticks: { color: '#9B9890', font: { size: 10 } }, grid: { display: false } },
+        y: { position: 'left', beginAtZero: true, ticks: { color: '#9B9890', font: { size: 10 } },
+             grid: { color: 'rgba(0,0,0,0.05)' }, title: { display: true, text: 'Tickets', color: '#9B9890', font: { size: 10 } } },
+        y1: { position: 'right', beginAtZero: true, ticks: { color: '#9B9890', font: { size: 10 } },
+              grid: { display: false }, title: { display: true, text: 'Requesters', color: '#9B9890', font: { size: 10 } } },
+      },
+    },
+  });
+})();
+</script>` : ''}
+
+${routingSummary ? `
+<div class="section">
+  <div class="section-header"><span class="section-label">Cross-group routing — tickets that started in HD</span><div class="section-rule"></div></div>
+  <div class="kpi-grid-3">
+    <div class="kpi-card"><div class="kpi-label">Candidates identified</div><div class="kpi-value">${routingSummary.totalCandidates.toLocaleString()}</div><div class="kpi-sub">tickets currently in another group</div></div>
+    <div class="kpi-card"><div class="kpi-label">Checked so far</div><div class="kpi-value">${routingSummary.totalChecked.toLocaleString()}</div><div class="kpi-sub">${routingSummary.totalCandidates ? Math.round(routingSummary.totalChecked / routingSummary.totalCandidates * 100) : 0}% of candidates</div></div>
+    <div class="kpi-card amber"><div class="kpi-label">Started in HD, routed out</div><div class="kpi-value">${routingSummary.routedOutCount.toLocaleString()}</div><div class="kpi-sub">confirmed so far</div></div>
+  </div>
+  ${routingSummary.byDestGroup.length ? `
+  <div class="table-card" style="margin-top:16px"><table>
+    <thead><tr><th>Destination group</th><th class="r">Tickets routed there from HD</th><th class="r">% of routed-out tickets</th></tr></thead>
+    <tbody>${routingSummary.byDestGroup.map(g => `<tr><td>${g.groupName}</td><td class="r">${g.count}</td><td class="r">${g.pct.toFixed(1)}%</td></tr>`).join('')}</tbody>
+  </table></div>` : ''}
+  <div class="insight"><strong>Notes:</strong> this checks each candidate ticket's Freshservice activity log for its original group at creation vs. its current group — a ticket only needs checking once, since past history doesn't change. ${routingSummary.totalCandidates - routingSummary.totalChecked > 0 ? `${(routingSummary.totalCandidates - routingSummary.totalChecked).toLocaleString()} candidates are still unchecked and will be picked up ${ROUTING_CHECK_BUDGET} at a time on future runs.` : 'All known candidates have been checked.'} Only tickets currently in a <em>different</em> group are candidates — a ticket resolved without ever leaving HD was never a candidate in the first place.</div>
+</div>` : ''}
+
 <hr>
 <div class="footer">
   <span>PGIS IT Operations · HD Team (17000367080) · All statuses · Auto-updated nightly</span>
@@ -498,10 +797,12 @@ async function main() {
   const dueFullResync = !prev || !prev.lastFullSyncAt ||
     (now - new Date(prev.lastFullSyncAt)) >= FULL_RESYNC_DAYS * 86400000;
 
-  let all, lastFullSyncAt;
+  let all, lastFullSyncAt, rawForRouting = null;
   if (dueFullResync) {
     console.log(prev ? 'Mode: full reconcile (periodic)' : 'Mode: initial backfill');
-    all = await fetchAllTickets();
+    const raw = await fetchAllTicketsRaw();
+    all = filterHdTickets(raw);
+    rawForRouting = raw; // only a full-resync sees all groups, needed for routing candidates
     lastFullSyncAt = now.toISOString();
   } else {
     const since = new Date(new Date(prev.lastSyncedAt).getTime() - SYNC_OVERLAP_MS).toISOString();
@@ -514,6 +815,44 @@ async function main() {
 
   if (all.length === 0) throw new Error('Zero HD tickets after sync — aborting so we never publish an empty dashboard.');
   saveState({ lastSyncedAt: now.toISOString(), lastFullSyncAt, tickets: all });
+
+  // Freshservice group directory -- needed every run (not just full resyncs)
+  // to resolve a routing candidate's current group name, and to give
+  // classifyRouting HD's real display name for its plain-text-log fallback match.
+  console.log('Fetching Freshservice group directory...');
+  const groups = await fetchGroups();
+  const groupNamesById = new Map(groups.map(g => [g.id, g.name]));
+  const hdGroupName = groupNamesById.get(HD_GROUP) || null;
+  if (!hdGroupName) console.warn(`WARNING: HD_GROUP (${HD_GROUP}) not found in Freshservice groups — routing classification falls back to id-only matching.`);
+
+  // Cross-group routing history: the candidate list (non-HD tickets) only
+  // refreshes on a full resync (that's the only run with an all-groups raw
+  // fetch to mine); every run still spends its budget checking whatever's
+  // unchecked so far, so incremental nights make progress too.
+  const routingState = loadRoutingState();
+  if (rawForRouting) routingState.candidates = extractRoutingCandidates(rawForRouting);
+  routingState.checked = await updateRoutingHistory(routingState.candidates, routingState.checked, { hdGroupName, groupNamesById });
+  saveRoutingState(routingState);
+  const routingChecked = Object.values(routingState.checked);
+  const routedOut = routingChecked.filter(r => r.routedOut);
+  const byDestGroup = new Map();
+  for (const r of routedOut) {
+    const key = r.currentGroupName || `Group #${r.currentGroupId}`;
+    byDestGroup.set(key, (byDestGroup.get(key) || 0) + 1);
+  }
+  const routingSummary = {
+    totalCandidates: routingState.candidates.length,
+    totalChecked: routingChecked.length,
+    routedOutCount: routedOut.length,
+    byDestGroup: [...byDestGroup.entries()].sort((a, b) => b[1] - a[1]).map(([groupName, count]) => ({
+      groupName, count, pct: routedOut.length ? +(count / routedOut.length * 100).toFixed(1) : 0,
+    })),
+  };
+
+  const quarterlyVolume = [];
+  for (let y = WINDOW_START.getUTCFullYear(); y <= now.getUTCFullYear(); y++) {
+    quarterlyVolume.push(...buildQuarterlyVolume(all, y, now));
+  }
 
   const getMonth = (mo,yr) => all.filter(t=>{const d=new Date(t.created_at);return d.getUTCFullYear()===yr&&d.getUTCMonth()===mo;});
   const months = listMonths(WINDOW_START, now);
@@ -540,7 +879,7 @@ async function main() {
   } : null;
 
   const updated = now.toLocaleString('en-US',{timeZone:'America/New_York',month:'short',day:'numeric',year:'numeric',hour:'2-digit',minute:'2-digit'})+' ET';
-  const html = buildHTML({monthly,months,current,weekly,days,overall,updated,monthTrend});
+  const html = buildHTML({monthly,months,current,weekly,days,overall,updated,monthTrend,quarterlyVolume,routingSummary});
   fs.writeFileSync('index.html',html);
   console.log(`Dashboard written — ${html.length} chars, ${all.length} tickets processed`);
 }
@@ -549,4 +888,10 @@ if (require.main === module) {
   main().catch(err=>{console.error('FATAL:',err.message);process.exit(1);});
 }
 
-module.exports = { fetchAllTickets, pageTickets, nextDelayMs, mergeTickets, projectTicket, loadState, saveState, calcStats, getWeeks, getDays, buildHTML, listMonths, main, trendBadge };
+module.exports = {
+  fetchAllTickets, fetchAllTicketsRaw, filterHdTickets, fetchGroups, pageTickets, nextDelayMs, mergeTickets,
+  projectTicket, loadState, saveState, calcStats, getWeeks, getDays, buildHTML, listMonths, main, trendBadge,
+  buildQuarterlyVolume, yoyQuarterDelta,
+  extractRoutingCandidates, extractGroupHistory, classifyRouting, fetchTicketActivities,
+  loadRoutingState, saveRoutingState, updateRoutingHistory,
+};

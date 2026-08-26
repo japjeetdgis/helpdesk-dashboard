@@ -578,7 +578,7 @@ hr{border:none;border-top:1px solid var(--border);margin:32px 0}
 </style></head><body>
 <div class="header"><div class="header-inner">
   <div><div class="eyebrow">Patriot Growth Insurance Services · IT Operations</div><h1>Help Desk <span>Performance</span> Dashboard</h1></div>
-  <div><div class="auto-badge">⚡ Auto-updated · ${updated}</div><div class="header-sub">Freshservice · HD Team · All statuses incl. pending · Runs nightly 2AM ET</div></div>
+  <div><div class="auto-badge">⚡ Auto-updated · ${updated}</div><div class="header-sub">Freshservice · HD Team · All statuses incl. pending · Runs nightly 5PM ET</div></div>
 </div></div>
 
 <div class="page">
@@ -670,7 +670,7 @@ hr{border:none;border-top:1px solid var(--border);margin:32px 0}
     <div class="chart-card"><div class="chart-label">Avg resolution time (h)</div><div style="position:relative;height:180px"><canvas id="ttrChart"></canvas></div></div>
     <div class="chart-card"><div class="chart-label">Daily ticket volume</div><div style="position:relative;height:180px"><canvas id="volChart"></canvas></div></div>
   </div>
-  <div class="insight"><strong>Dashboard auto-updates nightly via GitHub Actions.</strong> Data pulled directly from Freshservice every day at 2:00 AM ET. All statuses including pending are included for full transparency.</div>
+  <div class="insight"><strong>Dashboard auto-updates nightly via GitHub Actions.</strong> Data pulled directly from Freshservice every day at 5:00 PM ET. All statuses including pending are included for full transparency.</div>
 </div>
 
 <div class="section">

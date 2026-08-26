@@ -2,7 +2,7 @@ name: Update Help Desk Dashboard
 
 on:
   schedule:
-    - cron: '0 6 * * *'   # Daily at 6:00 AM UTC (2:00 AM ET)
+    - cron: '0 21 * * *'  # Daily at 9:00 PM UTC (5:00 PM ET)
   workflow_dispatch:        # Manual trigger from GitHub UI
 
 permissions:

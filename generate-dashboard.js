@@ -82,11 +82,15 @@ async function withRetry(fn, { sleep, maxRetries, label }) {
 // added for the quarterly distinct-requester chart -- tickets cached before
 // this change lack the field entirely; see `buildQuarterlyVolume`'s
 // pendingResync handling, which needs a fresh full backfill to clear.
+// `type` (Freshservice's own categorical field -- "Incident", "Service
+// Request", "Problem", "Change", etc.) was added for the weekly top-3-types
+// breakdown -- same backfill caveat, see `topTicketTypes`'s pendingResync.
 function projectTicket(t) {
   return {
     id: t.id,
     group_id: t.group_id,
     requester_id: t.requester_id ?? null,
+    type: t.type ?? null,
     created_at: t.created_at,
     status: t.status,
     fr_escalated: t.fr_escalated,
@@ -460,6 +464,41 @@ function yoyQuarterDelta(quarters, q) {
   return +((q.total - prior.total) / prior.total * 100).toFixed(1);
 }
 
+// Top-N Freshservice ticket `type`s (Incident, Service Request, Problem,
+// Change, ...) by count, across ALL statuses, for whatever ticket set is
+// passed in — used for the current week's breakdown. `pendingResync` mirrors
+// `buildQuarterlyVolume`'s handling of a field added after tickets.json
+// already had cached rows without it: those rows are only backfilled by the
+// next full resync, so a set mixing old + new rows gets flagged rather than
+// silently undercounting a type.
+function topTicketTypes(tickets, n = 3) {
+  const withType = tickets.filter(t => 'type' in t);
+  const pendingResync = tickets.length > 0 && withType.length < tickets.length;
+  const counts = new Map();
+  for (const t of withType) {
+    const key = t.type || 'Unspecified';
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  const top = [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, n)
+    .map(([type, count]) => ({ type, count, pct: tickets.length ? +(count / tickets.length * 100).toFixed(1) : 0 }));
+  return { top, pendingResync };
+}
+
+// The 7-day block (anchored to day 1 of the month, same scheme as getWeeks
+// below) that contains `now` -- i.e. "this week", still in progress.
+function currentWeekBounds(now) {
+  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  const weekIndex = Math.floor((now.getUTCDate() - 1) / 7);
+  const weekStart = new Date(monthStart);
+  weekStart.setUTCDate(weekStart.getUTCDate() + weekIndex * 7);
+  const weekEnd = new Date(weekStart);
+  weekEnd.setUTCDate(weekEnd.getUTCDate() + 6);
+  weekEnd.setUTCHours(23, 59, 59, 999);
+  return { weekStart, weekEnd };
+}
+
 function getWeeks(monthTickets, now) {
   const weeks = [];
   const monShort = monthKey(now).split(' ')[0];
@@ -494,7 +533,7 @@ function getDays(monthTickets, now) {
 }
 
 function buildHTML(data) {
-  const { monthly, weekly, days, overall, updated, months, current, monthTrend, quarterlyVolume = [], routingSummary } = data;
+  const { monthly, weekly, days, overall, updated, months, current, monthTrend, quarterlyVolume = [], routingSummary, thisWeek } = data;
   const cur = monthly[current.key] || {};
   const wkColors = ['#2B5CE6','#1A7A52','#9B5DE5','#F15BB5','#00BBF9'];
   const wkLabels = JSON.stringify(weekly.map(w=>w.label));
@@ -622,6 +661,43 @@ hr{border:none;border-top:1px solid var(--border);margin:32px 0}
     <div class="chart-card"><div class="chart-label">FR → resolution (h)</div><div style="position:relative;height:160px"><canvas id="wk_fr2r"></canvas></div></div>
   </div>
 </div><hr>
+
+${thisWeek ? `
+<div class="section">
+  <div class="section-header"><span class="section-label">This week — ${thisWeek.label}</span><div class="section-rule"></div></div>
+  <div class="kpi-grid-4">
+    <div class="kpi-card blue"><div class="kpi-label">Tickets this week</div><div class="kpi-value">${thisWeek.total.toLocaleString()}</div><div class="kpi-sub">all statuses incl. pending</div></div>
+    ${thisWeek.types.map((t,i)=>`<div class="kpi-card${i===0?' green':''}"><div class="kpi-label">#${i+1} type</div><div class="kpi-value" style="font-size:18px">${t.type}</div><div class="kpi-sub">${t.count} tickets (${t.pct}%)</div></div>`).join('')}
+    ${Array(Math.max(0,3-thisWeek.types.length)).fill(0).map(()=>`<div class="kpi-card"><div class="kpi-label">—</div><div class="kpi-value" style="font-size:18px">n/a</div><div class="kpi-sub">no data yet</div></div>`).join('')}
+  </div>
+  <div class="chart-card-full" style="margin-top:16px">
+    <div class="chart-label">${thisWeek.types.length ? `Top ${thisWeek.types.length} ticket types this week` : 'Ticket types this week'}</div>
+    ${thisWeek.types.length
+      ? `<div style="position:relative;height:${Math.max(120,thisWeek.types.length*60)}px"><canvas id="typeChart"></canvas></div>`
+      : `<div style="padding:12px 0;color:var(--text-3);font-size:13px">No type data yet — pending the next full backfill.</div>`}
+  </div>
+  ${thisWeek.pendingResync ? `<div class="insight"><strong>Type breakdown is undercounted.</strong> Some of this week's cached tickets predate the \`type\` field being tracked and are excluded from the breakdown above until the next full backfill; the total tickets count is unaffected.</div>` : ''}
+</div>
+<script>
+(function(){
+  const typeLabels=${JSON.stringify(thisWeek.types.map(t=>t.type))};
+  const typeCounts=${JSON.stringify(thisWeek.types.map(t=>t.count))};
+  if (typeLabels.length) {
+    new Chart(document.getElementById('typeChart'), {
+      type: 'bar',
+      data: { labels: typeLabels, datasets: [{ data: typeCounts, backgroundColor: ['#2B5CE6','#1A7A52','#9B5DE5','#F15BB5','#00BBF9'], borderRadius: 4, barPercentage: .5 }] },
+      options: {
+        indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: false }, tooltip: { callbacks: { label: i => ' ' + i.raw + ' tickets' } } },
+        scales: {
+          x: { beginAtZero: true, ticks: { color: '#9B9890', font: { size: 10 } }, grid: { color: 'rgba(0,0,0,0.05)' } },
+          y: { ticks: { color: '#9B9890', font: { size: 11 } }, grid: { display: false } },
+        },
+      },
+    });
+  }
+})();
+</script>` : ''}
 
 <div class="section">
   <div class="section-header"><span class="section-label">Overall KPIs — since ${monthLong(OVERALL_KPI_START)} (Peterson's Team) through today · all statuses</span><div class="section-rule"></div></div>
@@ -865,6 +941,18 @@ async function main() {
   const days = getDays(monthTickets, now);
   const overall = calcStats(all.filter(t => new Date(t.created_at) >= OVERALL_KPI_START));
 
+  // This week (in progress) — total ticket count across all statuses, plus
+  // its top-3 ticket-type breakdown.
+  const { weekStart: thisWeekStart, weekEnd: thisWeekEnd } = currentWeekBounds(now);
+  const thisWeekTickets = all.filter(t => { const c = new Date(t.created_at); return c >= thisWeekStart && c <= thisWeekEnd; });
+  const { top: thisWeekTypes, pendingResync: thisWeekPendingResync } = topTicketTypes(thisWeekTickets, 3);
+  const thisWeek = {
+    label: `${monthKey(now).split(' ')[0]} ${thisWeekStart.getUTCDate()}–${thisWeekEnd.getUTCDate()}`,
+    total: thisWeekTickets.length,
+    types: thisWeekTypes,
+    pendingResync: thisWeekPendingResync,
+  };
+
   // Real month-over-month trend for the "Improving"/"Worsening" badges on the
   // Avg response/resolution KPI cards -- compares the last two *complete*
   // months (not the in-progress current one) rather than the hardcoded
@@ -879,7 +967,7 @@ async function main() {
   } : null;
 
   const updated = now.toLocaleString('en-US',{timeZone:'America/New_York',month:'short',day:'numeric',year:'numeric',hour:'2-digit',minute:'2-digit'})+' ET';
-  const html = buildHTML({monthly,months,current,weekly,days,overall,updated,monthTrend,quarterlyVolume,routingSummary});
+  const html = buildHTML({monthly,months,current,weekly,days,overall,updated,monthTrend,quarterlyVolume,routingSummary,thisWeek});
   fs.writeFileSync('index.html',html);
   console.log(`Dashboard written — ${html.length} chars, ${all.length} tickets processed`);
 }
@@ -891,7 +979,7 @@ if (require.main === module) {
 module.exports = {
   fetchAllTickets, fetchAllTicketsRaw, filterHdTickets, fetchGroups, pageTickets, nextDelayMs, mergeTickets,
   projectTicket, loadState, saveState, calcStats, getWeeks, getDays, buildHTML, listMonths, main, trendBadge,
-  buildQuarterlyVolume, yoyQuarterDelta,
+  buildQuarterlyVolume, yoyQuarterDelta, topTicketTypes, currentWeekBounds,
   extractRoutingCandidates, extractGroupHistory, classifyRouting, fetchTicketActivities,
   loadRoutingState, saveRoutingState, updateRoutingHistory,
 };

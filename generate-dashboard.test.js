@@ -2,7 +2,7 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 const {
   fetchAllTickets, pageTickets, nextDelayMs, mergeTickets, projectTicket, calcStats, buildHTML, getDays, getWeeks, listMonths, trendBadge,
-  buildQuarterlyVolume, yoyQuarterDelta,
+  buildQuarterlyVolume, yoyQuarterDelta, topTicketTypes, currentWeekBounds,
   extractRoutingCandidates, extractGroupHistory, classifyRouting, fetchTicketActivities, updateRoutingHistory,
 } = require('./generate-dashboard.js');
 
@@ -247,21 +247,23 @@ test('K. buildHTML renders the current month and full history dynamically', () =
 
 // --- incremental sync -------------------------------------------------------
 
-test('L. projectTicket keeps only the non-PII metric fields plus requester_id', () => {
+test('L. projectTicket keeps only the non-PII metric fields plus requester_id/type', () => {
   const p = projectTicket({
     id: 1, group_id: HD_GROUP, created_at: 'c', status: 2, fr_escalated: false, is_escalated: false,
-    subject: 'SECRET', description_text: 'PII', requester_id: 42,
+    subject: 'SECRET', description_text: 'PII', requester_id: 42, type: 'Incident',
     stats: { first_responded_at: 'a', resolved_at: 'b', closed_at: 'd', agent_responded_at: 'drop' },
   });
-  assert.deepEqual(Object.keys(p).sort(), ['created_at', 'fr_escalated', 'group_id', 'id', 'is_escalated', 'requester_id', 'stats', 'status']);
+  assert.deepEqual(Object.keys(p).sort(), ['created_at', 'fr_escalated', 'group_id', 'id', 'is_escalated', 'requester_id', 'stats', 'status', 'type']);
   assert.equal(p.subject, undefined);
   assert.equal(p.requester_id, 42);
+  assert.equal(p.type, 'Incident');
   assert.deepEqual(Object.keys(p.stats).sort(), ['closed_at', 'first_responded_at', 'resolved_at']);
 });
 
-test('L3. projectTicket defaults requester_id to null when absent', () => {
+test('L3. projectTicket defaults requester_id and type to null when absent', () => {
   const p = projectTicket({ id: 1, group_id: HD_GROUP, created_at: 'c', status: 2, fr_escalated: false, is_escalated: false });
   assert.equal(p.requester_id, null);
+  assert.equal(p.type, null);
 });
 
 test('M. mergeTickets upserts changed HD tickets, adds new, drops moved-out and pre-cutoff', () => {
@@ -645,4 +647,92 @@ test('Y3. updateRoutingHistory end-to-end on the real plain-text sample: matches
   assert.equal(updated[165177].startedInHD, false);
   assert.equal(updated[165177].routedOut, false);
   assert.equal(updated[165177].currentGroupName, 'Accounts Payable');
+});
+
+// --- this week: ticket count + top-3 types -----------------------------------
+
+test('Z. topTicketTypes ranks types by count, descending, capped at n', () => {
+  const tickets = [
+    { type: 'Incident' }, { type: 'Incident' }, { type: 'Incident' },
+    { type: 'Service Request' }, { type: 'Service Request' },
+    { type: 'Problem' },
+    { type: 'Change' },
+  ];
+  const { top } = topTicketTypes(tickets, 3);
+  assert.deepEqual(top.map(t => t.type), ['Incident', 'Service Request', 'Problem']);
+  assert.equal(top[0].count, 3);
+  assert.equal(top[0].pct, +(3 / 7 * 100).toFixed(1));
+});
+
+test('Z2. topTicketTypes groups a null type as Unspecified rather than dropping it', () => {
+  const tickets = [{ type: 'Incident' }, { type: null }, { type: null }];
+  const { top } = topTicketTypes(tickets, 3);
+  assert.deepEqual(top.map(t => t.type), ['Unspecified', 'Incident']);
+  assert.equal(top[0].count, 2);
+});
+
+test('Z3. topTicketTypes flags pendingResync when some tickets predate the type field entirely', () => {
+  const tickets = [{ type: 'Incident' }, { status: 2 }]; // second row has no `type` key at all
+  const { top, pendingResync } = topTicketTypes(tickets, 3);
+  assert.equal(pendingResync, true);
+  assert.deepEqual(top.map(t => t.type), ['Incident']);
+});
+
+test('Z4. topTicketTypes handles an empty set without dividing by zero', () => {
+  const { top, pendingResync } = topTicketTypes([], 3);
+  assert.deepEqual(top, []);
+  assert.equal(pendingResync, false);
+});
+
+test('AJ. currentWeekBounds returns the 7-day block (anchored to day 1 of the month) containing now', () => {
+  const { weekStart, weekEnd } = currentWeekBounds(new Date('2026-08-20T12:00:00Z'));
+  assert.equal(weekStart.toISOString(), '2026-08-15T00:00:00.000Z');
+  assert.equal(weekEnd.toISOString(), '2026-08-21T23:59:59.999Z');
+});
+
+test('AJ2. currentWeekBounds handles the first week of the month', () => {
+  const { weekStart, weekEnd } = currentWeekBounds(new Date('2026-08-03T12:00:00Z'));
+  assert.equal(weekStart.toISOString(), '2026-08-01T00:00:00.000Z');
+  assert.equal(weekEnd.toISOString(), '2026-08-07T23:59:59.999Z');
+});
+
+test('AK. buildHTML renders the This week section with total + top types', () => {
+  const html = buildHTML({
+    monthly: { 'Aug 2026': calcStats([]) },
+    months: [{ key: 'Aug 2026', long: 'August 2026', isCurrent: true }],
+    current: { key: 'Aug 2026', long: 'August 2026' },
+    weekly: [], days: [], overall: calcStats([]), updated: 'x',
+    thisWeek: { label: 'Aug 15–21', total: 42, pendingResync: false, types: [
+      { type: 'Incident', count: 20, pct: 47.6 },
+      { type: 'Service Request', count: 15, pct: 35.7 },
+      { type: 'Problem', count: 7, pct: 16.7 },
+    ] },
+  });
+  assert.match(html, /This week — Aug 15–21/);
+  assert.match(html, /id="typeChart"/);
+  assert.match(html, />42</);
+  assert.match(html, /Incident/);
+  assert.match(html, /Service Request/);
+});
+
+test('AK2. buildHTML omits the This week section when thisWeek is absent', () => {
+  const html = buildHTML({
+    monthly: { 'Aug 2026': calcStats([]) },
+    months: [{ key: 'Aug 2026', long: 'August 2026', isCurrent: true }],
+    current: { key: 'Aug 2026', long: 'August 2026' },
+    weekly: [], days: [], overall: calcStats([]), updated: 'x',
+  });
+  assert.doesNotMatch(html, /This week —/);
+  assert.doesNotMatch(html, /id="typeChart"/);
+});
+
+test('AK3. buildHTML surfaces the pendingResync caveat for This week when set', () => {
+  const html = buildHTML({
+    monthly: { 'Aug 2026': calcStats([]) },
+    months: [{ key: 'Aug 2026', long: 'August 2026', isCurrent: true }],
+    current: { key: 'Aug 2026', long: 'August 2026' },
+    weekly: [], days: [], overall: calcStats([]), updated: 'x',
+    thisWeek: { label: 'Aug 15–21', total: 5, pendingResync: true, types: [{ type: 'Incident', count: 3, pct: 60 }] },
+  });
+  assert.match(html, /undercounted/);
 });

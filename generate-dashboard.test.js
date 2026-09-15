@@ -2,7 +2,7 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 const {
   fetchAllTickets, pageTickets, nextDelayMs, mergeTickets, projectTicket, calcStats, buildHTML, getDays, getWeeks, listMonths, trendBadge,
-  buildQuarterlyVolume, yoyQuarterDelta, topTicketTypes, currentWeekBounds,
+  buildQuarterlyVolume, yoyQuarterDelta, buildWeeklyTrend,
   extractRoutingCandidates, extractGroupHistory, classifyRouting, fetchTicketActivities, updateRoutingHistory,
 } = require('./generate-dashboard.js');
 
@@ -218,9 +218,14 @@ test('H3. listMonths handles the year rollover', () => {
 
 test('I. getDays labels the actual current month, not a hardcoded June', () => {
   const days = getDays([dayTicket('2026-07-03T10:00:00Z')], new Date('2026-07-05T12:00:00Z'));
-  assert.equal(days.length, 5);            // Jul 1..5
+  assert.equal(days.length, 3);            // Jul 1-3 (weekdays only -- Jul 4-5, 2026 is Sat/Sun)
   assert.equal(days[0].label, 'Jul 1');
   assert.ok(days.every(d => !d.label.includes('Jun')), 'no June labels in July');
+});
+
+test('I2. getDays excludes weekend days entirely', () => {
+  const days = getDays([], new Date('2026-07-05T12:00:00Z')); // Jul 1-5, 2026; Jul 4 is Sat, Jul 5 is Sun
+  assert.deepEqual(days.map(d => d.label), ['Jul 1', 'Jul 2', 'Jul 3']);
 });
 
 test('J. getWeeks labels the actual current month', () => {
@@ -649,90 +654,98 @@ test('Y3. updateRoutingHistory end-to-end on the real plain-text sample: matches
   assert.equal(updated[165177].currentGroupName, 'Accounts Payable');
 });
 
-// --- this week: ticket count + top-3 types -----------------------------------
+// --- week-over-week FCR / avg resolution trend -------------------------------
 
-test('Z. topTicketTypes ranks types by count, descending, capped at n', () => {
+test('Z. buildWeeklyTrend returns weekly buckets spanning the trailing months, labeled by week', () => {
   const tickets = [
-    { type: 'Incident' }, { type: 'Incident' }, { type: 'Incident' },
-    { type: 'Service Request' }, { type: 'Service Request' },
-    { type: 'Problem' },
-    { type: 'Change' },
+    dayTicket('2026-06-09T10:00:00Z'),
+    dayTicket('2026-07-09T10:00:00Z'),
+    dayTicket('2026-08-09T10:00:00Z'),
   ];
-  const { top } = topTicketTypes(tickets, 3);
-  assert.deepEqual(top.map(t => t.type), ['Incident', 'Service Request', 'Problem']);
-  assert.equal(top[0].count, 3);
-  assert.equal(top[0].pct, +(3 / 7 * 100).toFixed(1));
+  const weeks = buildWeeklyTrend(tickets, new Date('2026-08-20T12:00:00Z'), 3);
+  assert.ok(weeks.length >= 3, 'should have at least one week per month covered');
+  assert.ok(weeks.some(w => w.label.includes('Jun')));
+  assert.ok(weeks.some(w => w.label.includes('Jul')));
+  assert.ok(weeks.some(w => w.label.includes('Aug')));
+  assert.ok(weeks.every(w => typeof w.fcr === 'number' || w.fcr === 0));
 });
 
-test('Z2. topTicketTypes groups a null type as Unspecified rather than dropping it', () => {
-  const tickets = [{ type: 'Incident' }, { type: null }, { type: null }];
-  const { top } = topTicketTypes(tickets, 3);
-  assert.deepEqual(top.map(t => t.type), ['Unspecified', 'Incident']);
-  assert.equal(top[0].count, 2);
+test('Z2. buildWeeklyTrend marks only the final (current, in-progress) week as isCurrent', () => {
+  const tickets = [dayTicket('2026-07-10T10:00:00Z'), dayTicket('2026-08-18T10:00:00Z')];
+  const weeks = buildWeeklyTrend(tickets, new Date('2026-08-20T12:00:00Z'), 2);
+  assert.equal(weeks.filter(w => w.isCurrent).length, 1);
+  assert.equal(weeks.at(-1).isCurrent, true);
 });
 
-test('Z3. topTicketTypes flags pendingResync when some tickets predate the type field entirely', () => {
-  const tickets = [{ type: 'Incident' }, { status: 2 }]; // second row has no `type` key at all
-  const { top, pendingResync } = topTicketTypes(tickets, 3);
-  assert.equal(pendingResync, true);
-  assert.deepEqual(top.map(t => t.type), ['Incident']);
+test('Z3. buildWeeklyTrend returns an empty array (not a throw) when there is no ticket data at all', () => {
+  // getWeeks (which this is built on) only surfaces weeks that actually had
+  // tickets -- an all-empty window legitimately yields zero trend points.
+  const weeks = buildWeeklyTrend([], new Date('2026-08-20T12:00:00Z'), 1);
+  assert.deepEqual(weeks, []);
 });
 
-test('Z4. topTicketTypes handles an empty set without dividing by zero', () => {
-  const { top, pendingResync } = topTicketTypes([], 3);
-  assert.deepEqual(top, []);
-  assert.equal(pendingResync, false);
-});
-
-test('AJ. currentWeekBounds returns the 7-day block (anchored to day 1 of the month) containing now', () => {
-  const { weekStart, weekEnd } = currentWeekBounds(new Date('2026-08-20T12:00:00Z'));
-  assert.equal(weekStart.toISOString(), '2026-08-15T00:00:00.000Z');
-  assert.equal(weekEnd.toISOString(), '2026-08-21T23:59:59.999Z');
-});
-
-test('AJ2. currentWeekBounds handles the first week of the month', () => {
-  const { weekStart, weekEnd } = currentWeekBounds(new Date('2026-08-03T12:00:00Z'));
-  assert.equal(weekStart.toISOString(), '2026-08-01T00:00:00.000Z');
-  assert.equal(weekEnd.toISOString(), '2026-08-07T23:59:59.999Z');
-});
-
-test('AK. buildHTML renders the This week section with total + top types', () => {
+test('AJ. buildHTML renders the week-over-week trend chart when weeklyTrend is provided', () => {
   const html = buildHTML({
     monthly: { 'Aug 2026': calcStats([]) },
     months: [{ key: 'Aug 2026', long: 'August 2026', isCurrent: true }],
     current: { key: 'Aug 2026', long: 'August 2026' },
     weekly: [], days: [], overall: calcStats([]), updated: 'x',
-    thisWeek: { label: 'Aug 15–21', total: 42, pendingResync: false, types: [
-      { type: 'Incident', count: 20, pct: 47.6 },
-      { type: 'Service Request', count: 15, pct: 35.7 },
-      { type: 'Problem', count: 7, pct: 16.7 },
-    ] },
+    weeklyTrend: [{ label: 'Aug 1–7', fcr: 80, avgTTR: 10, isCurrent: false }, { label: 'Aug 8–14', fcr: 85, avgTTR: 8, isCurrent: true }],
   });
-  assert.match(html, /This week — Aug 15–21/);
-  assert.match(html, /id="typeChart"/);
-  assert.match(html, />42</);
-  assert.match(html, /Incident/);
-  assert.match(html, /Service Request/);
+  assert.match(html, /Week-over-week trend/);
+  assert.match(html, /id="wkTrendChart"/);
 });
 
-test('AK2. buildHTML omits the This week section when thisWeek is absent', () => {
+test('AJ2. buildHTML omits the week-over-week trend section when weeklyTrend is empty', () => {
   const html = buildHTML({
     monthly: { 'Aug 2026': calcStats([]) },
     months: [{ key: 'Aug 2026', long: 'August 2026', isCurrent: true }],
     current: { key: 'Aug 2026', long: 'August 2026' },
     weekly: [], days: [], overall: calcStats([]), updated: 'x',
   });
-  assert.doesNotMatch(html, /This week —/);
-  assert.doesNotMatch(html, /id="typeChart"/);
+  assert.doesNotMatch(html, /Week-over-week trend/);
+  assert.doesNotMatch(html, /id="wkTrendChart"/);
 });
 
-test('AK3. buildHTML surfaces the pendingResync caveat for This week when set', () => {
+// --- Current-month week-grid cards: only dim weeks that haven't started -----
+
+test('AK. buildHTML never dims a real (data-bearing) week card, even at index 2/3', () => {
+  const weeks = [1, 2, 3, 4].map(n => ({ shortLabel: `Wk ${n}`, total: n, pending: 0, avgFRT: 5, avgTTR: 10, overSLA: 90 }));
   const html = buildHTML({
     monthly: { 'Aug 2026': calcStats([]) },
     months: [{ key: 'Aug 2026', long: 'August 2026', isCurrent: true }],
     current: { key: 'Aug 2026', long: 'August 2026' },
-    weekly: [], days: [], overall: calcStats([]), updated: 'x',
-    thisWeek: { label: 'Aug 15–21', total: 5, pendingResync: true, types: [{ type: 'Incident', count: 3, pct: 60 }] },
+    weekly: weeks, days: [], overall: calcStats([]), updated: 'x',
   });
-  assert.match(html, /undercounted/);
+  assert.doesNotMatch(html, /wk-card wk-dim/, 'a real week must never render with wk-dim');
+});
+
+test('AK2. buildHTML still dims the synthetic "Coming" placeholder for a week that has not started', () => {
+  const weeks = [{ shortLabel: 'Wk 1', total: 1, pending: 0, avgFRT: 5, avgTTR: 10, overSLA: 90 }];
+  const html = buildHTML({
+    monthly: { 'Aug 2026': calcStats([]) },
+    months: [{ key: 'Aug 2026', long: 'August 2026', isCurrent: true }],
+    current: { key: 'Aug 2026', long: 'August 2026' },
+    weekly: weeks, days: [], overall: calcStats([]), updated: 'x',
+  });
+  assert.match(html, /Coming/);
+  assert.match(html, /wk-card wk-dim/);
+});
+
+test('AK3. buildHTML marks a week-card metric wk-up only when it actually improved over the prior week', () => {
+  const weeks = [
+    { shortLabel: 'Wk 1', total: 5, pending: 0, avgFRT: 10, avgTTR: 20, overSLA: 80 },
+    { shortLabel: 'Wk 2', total: 5, pending: 0, avgFRT: 5, avgTTR: 22, overSLA: 90 }, // FRT improved, TTR worsened, SLA improved
+  ];
+  const html = buildHTML({
+    monthly: { 'Aug 2026': calcStats([]) },
+    months: [{ key: 'Aug 2026', long: 'August 2026', isCurrent: true }],
+    current: { key: 'Aug 2026', long: 'August 2026' },
+    weekly: weeks, days: [], overall: calcStats([]), updated: 'x',
+  });
+  // Week 2's avg-response row should be marked wk-up (5h < 10h); its
+  // avg-resolution row should not (25h > 20h is worse, not better).
+  assert.match(html, /Avg response<\/span><span class="wk-val wk-up">5\.0h/);
+  assert.match(html, /Avg resolution<\/span><span class="wk-val ">22\.0h/);
+  assert.match(html, /SLA<\/span><span class="wk-val wk-up">90%/);
 });

@@ -83,8 +83,8 @@ async function withRetry(fn, { sleep, maxRetries, label }) {
 // this change lack the field entirely; see `buildQuarterlyVolume`'s
 // pendingResync handling, which needs a fresh full backfill to clear.
 // `type` (Freshservice's own categorical field -- "Incident", "Service
-// Request", "Problem", "Change", etc.) was added for the weekly top-3-types
-// breakdown -- same backfill caveat, see `topTicketTypes`'s pendingResync.
+// Request", "Problem", "Change", etc.) was added for a since-removed
+// weekly top-3-types breakdown; kept in the projection for future use.
 function projectTicket(t) {
   return {
     id: t.id,
@@ -464,41 +464,6 @@ function yoyQuarterDelta(quarters, q) {
   return +((q.total - prior.total) / prior.total * 100).toFixed(1);
 }
 
-// Top-N Freshservice ticket `type`s (Incident, Service Request, Problem,
-// Change, ...) by count, across ALL statuses, for whatever ticket set is
-// passed in — used for the current week's breakdown. `pendingResync` mirrors
-// `buildQuarterlyVolume`'s handling of a field added after tickets.json
-// already had cached rows without it: those rows are only backfilled by the
-// next full resync, so a set mixing old + new rows gets flagged rather than
-// silently undercounting a type.
-function topTicketTypes(tickets, n = 3) {
-  const withType = tickets.filter(t => 'type' in t);
-  const pendingResync = tickets.length > 0 && withType.length < tickets.length;
-  const counts = new Map();
-  for (const t of withType) {
-    const key = t.type || 'Unspecified';
-    counts.set(key, (counts.get(key) || 0) + 1);
-  }
-  const top = [...counts.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, n)
-    .map(([type, count]) => ({ type, count, pct: tickets.length ? +(count / tickets.length * 100).toFixed(1) : 0 }));
-  return { top, pendingResync };
-}
-
-// The 7-day block (anchored to day 1 of the month, same scheme as getWeeks
-// below) that contains `now` -- i.e. "this week", still in progress.
-function currentWeekBounds(now) {
-  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
-  const weekIndex = Math.floor((now.getUTCDate() - 1) / 7);
-  const weekStart = new Date(monthStart);
-  weekStart.setUTCDate(weekStart.getUTCDate() + weekIndex * 7);
-  const weekEnd = new Date(weekStart);
-  weekEnd.setUTCDate(weekEnd.getUTCDate() + 6);
-  weekEnd.setUTCHours(23, 59, 59, 999);
-  return { weekStart, weekEnd };
-}
-
 function getWeeks(monthTickets, now) {
   const weeks = [];
   const monShort = monthKey(now).split(' ')[0];
@@ -524,16 +489,39 @@ function getDays(monthTickets, now) {
   const monShort = monthKey(now).split(' ')[0];
   const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
   while (d<=now) {
-    const ds = d.toISOString().substring(0,10);
-    const dt = monthTickets.filter(t=>t.created_at?.substring(0,10)===ds);
-    days.push({ label:`${monShort} ${d.getUTCDate()}`, isWeekend:[0,6].includes(d.getUTCDay()), ...calcStats(dt) });
+    if (![0,6].includes(d.getUTCDay())) {
+      const ds = d.toISOString().substring(0,10);
+      const dt = monthTickets.filter(t=>t.created_at?.substring(0,10)===ds);
+      days.push({ label:`${monShort} ${d.getUTCDate()}`, ...calcStats(dt) });
+    }
     d.setUTCDate(d.getUTCDate()+1);
   }
   return days;
 }
 
+// Week-over-week FCR rate + avg resolution time, spanning the trailing
+// WEEKLY_TREND_MONTHS calendar months (each split into the same
+// day-1-of-month-anchored weekly blocks getWeeks uses for the current month
+// alone) -- the existing weekly charts only ever covered the current month,
+// and the Monthly breakdown table only shows month granularity, so neither
+// metric had an actual week-over-week trend across time. Added 2026-09-15
+// per Japjeet/Peterson's ask.
+const WEEKLY_TREND_MONTHS = 3;
+function buildWeeklyTrend(tickets, now, monthsBack = WEEKLY_TREND_MONTHS) {
+  const weeks = [];
+  for (let i = monthsBack - 1; i >= 0; i--) {
+    const monthDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1));
+    const monthEnd = new Date(Date.UTC(monthDate.getUTCFullYear(), monthDate.getUTCMonth() + 1, 0, 23, 59, 59, 999));
+    const cap = i === 0 ? now : monthEnd;
+    const monthTickets = tickets.filter(t => { const c = new Date(t.created_at); return c >= monthDate && c <= cap; });
+    weeks.push(...getWeeks(monthTickets, cap).map(w => ({ label: w.shortLabel, fcr: w.fcr, avgTTR: w.avgTTR })));
+  }
+  if (weeks.length) weeks[weeks.length - 1].isCurrent = true;
+  return weeks;
+}
+
 function buildHTML(data) {
-  const { monthly, weekly, days, overall, updated, months, current, monthTrend, quarterlyVolume = [], routingSummary, thisWeek } = data;
+  const { monthly, weekly, days, overall, updated, months, current, monthTrend, quarterlyVolume = [], routingSummary, weeklyTrend = [] } = data;
   const cur = monthly[current.key] || {};
   const wkColors = ['#2B5CE6','#1A7A52','#9B5DE5','#F15BB5','#00BBF9'];
   const wkLabels = JSON.stringify(weekly.map(w=>w.label));
@@ -547,8 +535,14 @@ function buildHTML(data) {
   const dayFRT    = JSON.stringify(days.map(d=>d.avgFRT));
   const dayTTR    = JSON.stringify(days.map(d=>d.avgTTR));
   const dayVol    = JSON.stringify(days.map(d=>d.total));
-  const dayColors = JSON.stringify(days.map(d=>d.isWeekend?'#C8C5BC':'#2B5CE6'));
   const mo = (key,field) => monthly[key]?.[field]??'—';
+  // Real week-over-week direction (lower FRT/TTR = better, higher SLA/FCR =
+  // better) for the wk-grid card values, replacing what used to be a
+  // hardcoded "improved" (wk-up) class on every week but the first.
+  const wkTrendCls = (curVal, priorVal, higherIsBetter) => {
+    if (curVal == null || priorVal == null) return '';
+    return (higherIsBetter ? curVal > priorVal : curVal < priorVal) ? 'wk-up' : '';
+  };
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -636,15 +630,17 @@ hr{border:none;border-top:1px solid var(--border);margin:32px 0}
       </div>
     </div>
     <div class="wk-grid">
-      ${weekly.slice(0,4).map((w,i)=>`
-      <div class="wk-card${i>1?' wk-dim':''}">
+      ${weekly.slice(0,4).map((w,i)=>{
+        const prior = weekly[i-1];
+        return `
+      <div class="wk-card">
         <div class="wk-label">${w.shortLabel}</div>
         <div class="wk-row"><span>Tickets</span><span class="wk-val">${w.total}</span></div>
         <div class="wk-row"><span>Pending</span><span class="wk-val">${w.pending}</span></div>
-        <div class="wk-row"><span>Avg response</span><span class="wk-val ${i>0?'wk-up':''}">${fmt(w.avgFRT)}</span></div>
-        <div class="wk-row"><span>Avg resolution</span><span class="wk-val ${i>0?'wk-up':''}">${fmt(w.avgTTR)}</span></div>
-        <div class="wk-row"><span>SLA</span><span class="wk-val ${i>0?'wk-up':''}">${w.overSLA}%</span></div>
-      </div>`).join('')}
+        <div class="wk-row"><span>Avg response</span><span class="wk-val ${wkTrendCls(w.avgFRT,prior?.avgFRT,false)}">${fmt(w.avgFRT)}</span></div>
+        <div class="wk-row"><span>Avg resolution</span><span class="wk-val ${wkTrendCls(w.avgTTR,prior?.avgTTR,false)}">${fmt(w.avgTTR)}</span></div>
+        <div class="wk-row"><span>SLA</span><span class="wk-val ${wkTrendCls(w.overSLA,prior?.overSLA,true)}">${w.overSLA}%</span></div>
+      </div>`;}).join('')}
       ${Array(Math.max(0,4-weekly.length)).fill(0).map((_,i)=>`
       <div class="wk-card wk-dim"><div class="wk-label">Week ${weekly.length+i+1} · Coming</div>
         <div style="font-size:12px;color:rgba(255,255,255,.4);margin-top:8px">Not started yet</div></div>`).join('')}
@@ -661,43 +657,6 @@ hr{border:none;border-top:1px solid var(--border);margin:32px 0}
     <div class="chart-card"><div class="chart-label">FR → resolution (h)</div><div style="position:relative;height:160px"><canvas id="wk_fr2r"></canvas></div></div>
   </div>
 </div><hr>
-
-${thisWeek ? `
-<div class="section">
-  <div class="section-header"><span class="section-label">This week — ${thisWeek.label}</span><div class="section-rule"></div></div>
-  <div class="kpi-grid-4">
-    <div class="kpi-card blue"><div class="kpi-label">Tickets this week</div><div class="kpi-value">${thisWeek.total.toLocaleString()}</div><div class="kpi-sub">all statuses incl. pending</div></div>
-    ${thisWeek.types.map((t,i)=>`<div class="kpi-card${i===0?' green':''}"><div class="kpi-label">#${i+1} type</div><div class="kpi-value" style="font-size:18px">${t.type}</div><div class="kpi-sub">${t.count} tickets (${t.pct}%)</div></div>`).join('')}
-    ${Array(Math.max(0,3-thisWeek.types.length)).fill(0).map(()=>`<div class="kpi-card"><div class="kpi-label">—</div><div class="kpi-value" style="font-size:18px">n/a</div><div class="kpi-sub">no data yet</div></div>`).join('')}
-  </div>
-  <div class="chart-card-full" style="margin-top:16px">
-    <div class="chart-label">${thisWeek.types.length ? `Top ${thisWeek.types.length} ticket types this week` : 'Ticket types this week'}</div>
-    ${thisWeek.types.length
-      ? `<div style="position:relative;height:${Math.max(120,thisWeek.types.length*60)}px"><canvas id="typeChart"></canvas></div>`
-      : `<div style="padding:12px 0;color:var(--text-3);font-size:13px">No type data yet — pending the next full backfill.</div>`}
-  </div>
-  ${thisWeek.pendingResync ? `<div class="insight"><strong>Type breakdown is undercounted.</strong> Some of this week's cached tickets predate the \`type\` field being tracked and are excluded from the breakdown above until the next full backfill; the total tickets count is unaffected.</div>` : ''}
-</div>
-<script>
-(function(){
-  const typeLabels=${JSON.stringify(thisWeek.types.map(t=>t.type))};
-  const typeCounts=${JSON.stringify(thisWeek.types.map(t=>t.count))};
-  if (typeLabels.length) {
-    new Chart(document.getElementById('typeChart'), {
-      type: 'bar',
-      data: { labels: typeLabels, datasets: [{ data: typeCounts, backgroundColor: ['#2B5CE6','#1A7A52','#9B5DE5','#F15BB5','#00BBF9'], borderRadius: 4, barPercentage: .5 }] },
-      options: {
-        indexAxis: 'y', responsive: true, maintainAspectRatio: false,
-        plugins: { legend: { display: false }, tooltip: { callbacks: { label: i => ' ' + i.raw + ' tickets' } } },
-        scales: {
-          x: { beginAtZero: true, ticks: { color: '#9B9890', font: { size: 10 } }, grid: { color: 'rgba(0,0,0,0.05)' } },
-          y: { ticks: { color: '#9B9890', font: { size: 11 } }, grid: { display: false } },
-        },
-      },
-    });
-  }
-})();
-</script>` : ''}
 
 <div class="section">
   <div class="section-header"><span class="section-label">Overall KPIs — since ${monthLong(OVERALL_KPI_START)} (Peterson's Team) through today · all statuses</span><div class="section-rule"></div></div>
@@ -733,11 +692,55 @@ ${thisWeek ? `
   </table></div>
 </div>
 
+${weeklyTrend.length ? `
+<div class="section">
+  <div class="section-header"><span class="section-label">Week-over-week trend — FCR rate &amp; avg resolution time</span><div class="section-rule"></div></div>
+  <div class="chart-card-full">
+    <div class="chart-label">Last ${WEEKLY_TREND_MONTHS} months by week</div>
+    <div style="position:relative;height:240px"><canvas id="wkTrendChart"></canvas></div>
+  </div>
+</div>
+<script>
+(function(){
+  const wtLabels=${JSON.stringify(weeklyTrend.map(w=>w.label))};
+  const wtFcr=${JSON.stringify(weeklyTrend.map(w=>w.fcr))};
+  const wtTtr=${JSON.stringify(weeklyTrend.map(w=>w.avgTTR))};
+  const wtCurrent=${JSON.stringify(weeklyTrend.map(w=>!!w.isCurrent))};
+  const hollow = base => wtCurrent.map(c => c ? '#fff' : base);
+  new Chart(document.getElementById('wkTrendChart'), {
+    type: 'line',
+    data: { labels: wtLabels, datasets: [
+      { label: 'FCR rate (%)', data: wtFcr, borderColor: '#1A7A52', backgroundColor: '#1A7A52',
+        pointBackgroundColor: hollow('#1A7A52'), pointBorderColor: '#1A7A52', pointBorderWidth: 2,
+        pointRadius: 4, pointHoverRadius: 6, tension: .25, yAxisID: 'y' },
+      { label: 'Avg resolution (h)', data: wtTtr, borderColor: '#2B5CE6', backgroundColor: '#2B5CE6',
+        pointBackgroundColor: hollow('#2B5CE6'), pointBorderColor: '#2B5CE6', pointBorderWidth: 2,
+        pointRadius: 4, pointHoverRadius: 6, tension: .25, yAxisID: 'y1' },
+    ] },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { position: 'bottom', labels: { boxWidth: 10, font: { size: 10 }, color: '#6B6860' } },
+        tooltip: { callbacks: { label: (ctx) => {
+          const cur = wtCurrent[ctx.dataIndex] ? ' (in progress)' : '';
+          return ctx.datasetIndex === 0 ? ' FCR: ' + ctx.raw + '%' + cur : ' Avg resolution: ' + (ctx.raw ?? 'n/a') + 'h' + cur;
+        } } },
+      },
+      scales: {
+        x: { ticks: { color: '#9B9890', font: { size: 10 } }, grid: { display: false } },
+        y: { position: 'left', beginAtZero: true, max: 100, ticks: { color: '#9B9890', font: { size: 10 } },
+             grid: { color: 'rgba(0,0,0,0.05)' }, title: { display: true, text: 'FCR %', color: '#9B9890', font: { size: 10 } } },
+        y1: { position: 'right', beginAtZero: true, ticks: { color: '#9B9890', font: { size: 10 } },
+              grid: { display: false }, title: { display: true, text: 'Hours', color: '#9B9890', font: { size: 10 } } },
+      },
+    },
+  });
+})();
+</script>` : ''}
+
 <div class="section">
   <div class="section-header"><span class="section-label">Daily trends — ${current.long}</span><div class="section-rule"></div></div>
   <div class="legend">
-    <div class="li"><div class="sw" style="background:#2B5CE6"></div>Weekdays</div>
-    <div class="li"><div class="sw" style="background:#C8C5BC"></div>Weekend</div>
     <div class="li"><div class="sl" style="background:#B03A2E"></div>90% SLA target</div>
   </div>
   <div class="chart-card-full"><div class="chart-label">SLA first response rate (%)</div><div style="position:relative;height:200px"><canvas id="slaChart"></canvas></div></div>
@@ -746,7 +749,7 @@ ${thisWeek ? `
     <div class="chart-card"><div class="chart-label">Avg resolution time (h)</div><div style="position:relative;height:180px"><canvas id="ttrChart"></canvas></div></div>
     <div class="chart-card"><div class="chart-label">Daily ticket volume</div><div style="position:relative;height:180px"><canvas id="volChart"></canvas></div></div>
   </div>
-  <div class="insight"><strong>Dashboard auto-updates nightly via GitHub Actions.</strong> Data pulled directly from Freshservice every day at 5:00 PM ET. All statuses including pending are included for full transparency.</div>
+  <div class="insight"><strong>Dashboard auto-updates nightly via GitHub Actions.</strong> Data pulled directly from Freshservice every day at 5:00 PM ET. All statuses including pending are included for full transparency. Weekends are excluded — HD volume on Sat/Sun is negligible and was cluttering the trend.</div>
 </div>
 
 <div class="section">
@@ -854,16 +857,16 @@ ${routingSummary ? `
 
 <script>
 const wkLabels=${wkLabels},wkBg=${wkBg};
-const dayLabels=${dayLabels},dayColors=${dayColors};
+const dayLabels=${dayLabels};
 const mkOpts=(yMin,yMax,sfx)=>({responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:i=>i.raw!=null?' '+i.raw+sfx:' no data'}}},scales:{x:{ticks:{color:'#9B9890',font:{size:10},autoSkip:false,maxRotation:45},grid:{display:false}},y:{min:yMin,max:yMax,ticks:{color:'#9B9890',font:{size:10},callback:v=>v+sfx},grid:{color:'rgba(0,0,0,0.05)'}}}});
 new Chart(document.getElementById('wk_vol'),{type:'bar',data:{labels:wkLabels,datasets:[{data:${wkVol},backgroundColor:wkBg,borderRadius:4,barPercentage:.5}]},options:mkOpts(0,null,'')});
 new Chart(document.getElementById('wk_frt'),{type:'bar',data:{labels:wkLabels,datasets:[{data:${wkFRT},backgroundColor:wkBg,borderRadius:4,barPercentage:.5}]},options:mkOpts(0,null,'h')});
 new Chart(document.getElementById('wk_ttr'),{type:'bar',data:{labels:wkLabels,datasets:[{data:${wkTTR},backgroundColor:wkBg,borderRadius:4,barPercentage:.5}]},options:mkOpts(0,null,'h')});
 new Chart(document.getElementById('wk_fr2r'),{type:'bar',data:{labels:wkLabels,datasets:[{data:${wkFR2R},backgroundColor:wkBg,borderRadius:4,barPercentage:.5}]},options:mkOpts(0,null,'h')});
-new Chart(document.getElementById('slaChart'),{type:'bar',data:{labels:dayLabels,datasets:[{data:${daySLA},backgroundColor:dayColors,borderRadius:3,barPercentage:.65},{data:dayLabels.map(()=>90),type:'line',borderColor:'#B03A2E',borderWidth:1.5,borderDash:[5,3],pointRadius:0,fill:false}]},options:mkOpts(70,105,'%')});
-new Chart(document.getElementById('frtChart'),{type:'bar',data:{labels:dayLabels,datasets:[{data:${dayFRT},backgroundColor:dayColors,borderRadius:3,barPercentage:.65}]},options:mkOpts(0,null,'h')});
-new Chart(document.getElementById('ttrChart'),{type:'bar',data:{labels:dayLabels,datasets:[{data:${dayTTR},backgroundColor:dayColors,borderRadius:3,barPercentage:.65}]},options:mkOpts(0,null,'h')});
-new Chart(document.getElementById('volChart'),{type:'bar',data:{labels:dayLabels,datasets:[{data:${dayVol},backgroundColor:dayColors,borderRadius:3,barPercentage:.65}]},options:mkOpts(0,null,'')});
+new Chart(document.getElementById('slaChart'),{type:'bar',data:{labels:dayLabels,datasets:[{data:${daySLA},backgroundColor:'#2B5CE6',borderRadius:3,barPercentage:.65},{data:dayLabels.map(()=>90),type:'line',borderColor:'#B03A2E',borderWidth:1.5,borderDash:[5,3],pointRadius:0,fill:false}]},options:mkOpts(70,105,'%')});
+new Chart(document.getElementById('frtChart'),{type:'bar',data:{labels:dayLabels,datasets:[{data:${dayFRT},backgroundColor:'#2B5CE6',borderRadius:3,barPercentage:.65}]},options:mkOpts(0,null,'h')});
+new Chart(document.getElementById('ttrChart'),{type:'bar',data:{labels:dayLabels,datasets:[{data:${dayTTR},backgroundColor:'#2B5CE6',borderRadius:3,barPercentage:.65}]},options:mkOpts(0,null,'h')});
+new Chart(document.getElementById('volChart'),{type:'bar',data:{labels:dayLabels,datasets:[{data:${dayVol},backgroundColor:'#2B5CE6',borderRadius:3,barPercentage:.65}]},options:mkOpts(0,null,'')});
 </script></body></html>`;
 }
 
@@ -940,18 +943,7 @@ async function main() {
   const weekly = getWeeks(monthTickets, now);
   const days = getDays(monthTickets, now);
   const overall = calcStats(all.filter(t => new Date(t.created_at) >= OVERALL_KPI_START));
-
-  // This week (in progress) — total ticket count across all statuses, plus
-  // its top-3 ticket-type breakdown.
-  const { weekStart: thisWeekStart, weekEnd: thisWeekEnd } = currentWeekBounds(now);
-  const thisWeekTickets = all.filter(t => { const c = new Date(t.created_at); return c >= thisWeekStart && c <= thisWeekEnd; });
-  const { top: thisWeekTypes, pendingResync: thisWeekPendingResync } = topTicketTypes(thisWeekTickets, 3);
-  const thisWeek = {
-    label: `${monthKey(now).split(' ')[0]} ${thisWeekStart.getUTCDate()}–${thisWeekEnd.getUTCDate()}`,
-    total: thisWeekTickets.length,
-    types: thisWeekTypes,
-    pendingResync: thisWeekPendingResync,
-  };
+  const weeklyTrend = buildWeeklyTrend(all, now);
 
   // Real month-over-month trend for the "Improving"/"Worsening" badges on the
   // Avg response/resolution KPI cards -- compares the last two *complete*
@@ -967,7 +959,7 @@ async function main() {
   } : null;
 
   const updated = now.toLocaleString('en-US',{timeZone:'America/New_York',month:'short',day:'numeric',year:'numeric',hour:'2-digit',minute:'2-digit'})+' ET';
-  const html = buildHTML({monthly,months,current,weekly,days,overall,updated,monthTrend,quarterlyVolume,routingSummary,thisWeek});
+  const html = buildHTML({monthly,months,current,weekly,days,overall,updated,monthTrend,quarterlyVolume,routingSummary,weeklyTrend});
   fs.writeFileSync('index.html',html);
   console.log(`Dashboard written — ${html.length} chars, ${all.length} tickets processed`);
 }
@@ -979,7 +971,7 @@ if (require.main === module) {
 module.exports = {
   fetchAllTickets, fetchAllTicketsRaw, filterHdTickets, fetchGroups, pageTickets, nextDelayMs, mergeTickets,
   projectTicket, loadState, saveState, calcStats, getWeeks, getDays, buildHTML, listMonths, main, trendBadge,
-  buildQuarterlyVolume, yoyQuarterDelta, topTicketTypes, currentWeekBounds,
+  buildQuarterlyVolume, yoyQuarterDelta, buildWeeklyTrend,
   extractRoutingCandidates, extractGroupHistory, classifyRouting, fetchTicketActivities,
   loadRoutingState, saveRoutingState, updateRoutingHistory,
 };

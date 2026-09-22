@@ -85,11 +85,16 @@ async function withRetry(fn, { sleep, maxRetries, label }) {
 // `type` (Freshservice's own categorical field -- "Incident", "Service
 // Request", "Problem", "Change", etc.) was added for a since-removed
 // weekly top-3-types breakdown; kept in the projection for future use.
+// `responder_id` (current assigned agent, a numeric FK like requester_id --
+// not PII by itself) was added for Iris bot-involvement tracking; tickets
+// cached before this change lack the field until the next full backfill,
+// same caveat as requester_id.
 function projectTicket(t) {
   return {
     id: t.id,
     group_id: t.group_id,
     requester_id: t.requester_id ?? null,
+    responder_id: t.responder_id ?? null,
     type: t.type ?? null,
     created_at: t.created_at,
     status: t.status,
@@ -399,6 +404,211 @@ async function updateRoutingHistory(candidates, checked, opts = {}) {
   return updated;
 }
 
+// --- Iris bot involvement (fully resolved by Iris / reassigned to a human /
+// reviewed with notes) + post-handoff timing -------------------------------
+//
+// Iris is a new AI bot integrated into the Freshservice service desk as its
+// own agent account (SVC_iris@patriotgis.com). Freshservice's ticket-list API
+// only ever shows a ticket's *current* responder, so recovering "did Iris
+// ever hold this ticket, and when did it hand off to a human" requires the
+// same per-ticket Activities log the cross-group routing feature above
+// already mines -- same shape of problem, applied to the agent axis instead
+// of the group axis. Per Barninder Khurana (CIO), "Iris Day 3 Update" email
+// thread, 2026-09-21: leadership wants tickets split into Overall / With Iris
+// (resolved by Iris, reassigned to human, reviewed-with-notes) / Post human
+// handoff (response & resolution clocks restarted at the handoff timestamp).
+
+const IRIS_EMAIL = 'SVC_iris@patriotgis.com';
+// Iris went live 2026-09-14 (per Japjeet directly, 2026-09-22 -- supersedes an
+// earlier ~2026-09-18 guess inferred from the "Iris Day 3 Update" email's
+// send date). Candidates are scoped to tickets created on/after this date --
+// deliberately narrower than routing's all-time candidate set, which needs
+// the full DATA_START window because a routed-out ticket could be arbitrarily
+// old. Iris tickets can't predate its own go-live, so there's no reason to
+// pay that same backfill cost here.
+const IRIS_LIVE_SINCE = '2026-09-14T00:00:00Z';
+const IRIS_FILE = process.env.IRIS_FILE || 'iris-history.json'; // persisted cache, committed to the repo
+const IRIS_CHECK_BUDGET = 1000; // same pacing rationale as ROUTING_CHECK_BUDGET
+
+// Minimal, IN-MEMORY-ONLY agent directory fetch -- never written to disk.
+// This repo is intentionally non-PII-minimal (see projectTicket's header
+// comment); unlike helpdesk-dashboard-analyst, it must not gain a committed
+// agent/email directory just to resolve one bot account's id.
+async function fetchAgentDirectoryMinimal(opts = {}) {
+  const { client = axios, sleep = realSleep, maxRetries = 3, maxPages = 20 } = opts;
+  const all = [];
+  let page = 1;
+  while (page <= maxPages) {
+    const res = await withRetry(
+      () => client.get(`${baseURL}/agents`, { auth, params: { per_page: 100, page } }),
+      { sleep, maxRetries, label: `agents page ${page}` }
+    );
+    const agents = res.data.agents || [];
+    all.push(...agents);
+    if (agents.length < 100) break;
+    page++;
+    await sleep(nextDelayMs(res.headers));
+  }
+  return all;
+}
+
+function resolveIrisAgent(agents, email = IRIS_EMAIL) {
+  const a = agents.find(a => (a.email || '').toLowerCase() === email.toLowerCase());
+  return a ? { id: a.id, name: [a.first_name, a.last_name].filter(Boolean).join(' ') || a.email } : null;
+}
+
+// PLACEHOLDER -- unverified against a real Freshservice activity log. Iris
+// only went live 2026-09-18 and there's no local Freshservice API access in
+// this environment to pull a real "agent reassigned" sample, so this is a
+// best-guess pattern modeled on GROUP_ACTIVITY_RE's two known forms (HTML vs.
+// plain-text). AGENT_ACTIVITY_RE_VERIFIED below keeps this from being trusted
+// until it's confirmed against a real GET /tickets/{id}/activities response
+// for a ticket that actually got reassigned from Iris to a human.
+const AGENT_ACTIVITY_RE = /set Agent as (?:<a[^>]*href="\/agents\/(\d+)"[^>]*>([^<]*)<\/a>|([^,<]+?)(?=,| and |$))/;
+
+// Same oldest-first extraction shape as extractGroupHistory.
+function extractResponderHistory(activities) {
+  return [...activities].reverse()
+    .map(a => {
+      const m = a.content && a.content.match(AGENT_ACTIVITY_RE);
+      if (!m) return null;
+      const agentId = m[1] ? +m[1] : null;
+      const agentName = (m[2] ?? m[3] ?? '').trim();
+      return agentName ? { agentId, agentName, at: a.created_at } : null;
+    })
+    .filter(Boolean);
+}
+
+// Verification gate -- flip to true only after confirming AGENT_ACTIVITY_RE
+// against a real activity log (see the comment above it). While false,
+// classifyIrisInvolvement always returns 'unknown', so the dashboard never
+// shows a guessed category. Test AL5 enforces this can't be silently removed.
+const AGENT_ACTIVITY_RE_VERIFIED = false;
+
+// Once verified, classifies a ticket as:
+//   'fullyIris' -- Iris held it and still does (current responder is Iris)
+//   'handoff'   -- Iris held it at some point, current responder is a human
+//   'none'      -- Iris never appears in the responder history
+// The *current* responder always comes from the live ticket's responder_id,
+// never from parsed text -- same trust rule as classifyRouting.
+function classifyIrisInvolvement(activities, irisAgentId, irisAgentName, currentResponderId) {
+  if (!AGENT_ACTIVITY_RE_VERIFIED) return { category: 'unknown' };
+  const history = extractResponderHistory(activities);
+  const isIris = h => (h.agentId != null && h.agentId === irisAgentId)
+    || (irisAgentName && h.agentName.toLowerCase() === irisAgentName.toLowerCase());
+  const firstIrisIdx = history.findIndex(isIris);
+  if (firstIrisIdx === -1) return { category: 'none' };
+  if (currentResponderId === irisAgentId) return { category: 'fullyIris' };
+  const handoffEvent = history.slice(firstIrisIdx + 1).find(h => !isIris(h));
+  return { category: 'handoff', handoffAt: handoffEvent ? handoffEvent.at : null, handoffToAgentId: currentResponderId };
+}
+
+// Candidates for the Iris check: every HD ticket created since Iris went
+// live. Unlike routing candidates (non-HD tickets, checked to see if they
+// ever passed through HD), we don't yet know which HD tickets Iris touched
+// until the activities log is checked, so all of them are candidates.
+function extractIrisCandidates(hdTickets, sinceISO = IRIS_LIVE_SINCE) {
+  const since = new Date(sinceISO);
+  return hdTickets
+    .filter(t => new Date(t.created_at) >= since)
+    .map(t => ({ id: t.id, responder_id: t.responder_id, created_at: t.created_at }));
+}
+
+function loadIrisState() {
+  try {
+    const s = JSON.parse(fs.readFileSync(IRIS_FILE, 'utf8'));
+    if (s && Array.isArray(s.candidates) && s.checked && typeof s.checked === 'object') return s;
+  } catch { /* missing or corrupt → start fresh */ }
+  return { candidates: [], checked: {}, irisAgentId: null, irisAgentName: null };
+}
+
+function saveIrisState(state) {
+  fs.writeFileSync(IRIS_FILE, JSON.stringify(state));
+}
+
+// Same budget-capped, non-fatal-per-ticket-failure loop as updateRoutingHistory.
+async function updateIrisHistory(candidates, checked, opts = {}) {
+  const { budget = IRIS_CHECK_BUDGET, client, sleep = realSleep, irisAgentId = null, irisAgentName = null } = opts;
+  const unchecked = candidates.filter(c => !checked[c.id]);
+  const batch = unchecked.slice(0, budget);
+  console.log(`Iris check: ${batch.length}/${unchecked.length} unchecked candidates this run (${Object.keys(checked).length} already known)`);
+  const updated = { ...checked };
+  for (const c of batch) {
+    try {
+      const activities = await fetchTicketActivities(c.id, { client, sleep });
+      const result = classifyIrisInvolvement(activities, irisAgentId, irisAgentName, c.responder_id);
+      updated[c.id] = { ...result, responder_id: c.responder_id, created_at: c.created_at, checkedAt: new Date().toISOString() };
+    } catch (e) {
+      console.warn(`  Activities lookup failed for ticket ${c.id}: ${e.message} — will retry next run`);
+    }
+  }
+  return updated;
+}
+
+// Category counts + the "fully handled by Iris" rollup (resolved + reassigned).
+// `pendingVerification` mirrors AGENT_ACTIVITY_RE_VERIFIED so buildHTML can
+// render an honest "pending" state instead of a real-looking zero.
+function buildIrisSummary(candidates, checked) {
+  const values = Object.values(checked);
+  const counts = { fullyIris: 0, handoff: 0, reviewedWithNotes: 0, none: 0, unknown: 0 };
+  for (const v of values) counts[v.category] = (counts[v.category] || 0) + 1;
+  return {
+    totalCandidates: candidates.length,
+    totalChecked: values.length,
+    fullyIris: counts.fullyIris,
+    handoff: counts.handoff,
+    reviewedWithNotes: counts.reviewedWithNotes,
+    fullyHandledByIris: counts.fullyIris + counts.handoff,
+    pendingVerification: !AGENT_ACTIVITY_RE_VERIFIED,
+  };
+}
+
+// Pure mapper: for 'handoff'-category tickets only, returns a synthetic
+// ticket array with created_at replaced by the handoff timestamp, so the
+// existing calcStats() can compute post-handoff response/resolution times
+// with zero duplicated stats math. Tickets with no known handoffAt (activity
+// log lookup pending, or classification still 'unknown') are excluded rather
+// than guessed at.
+function buildPostHandoffTickets(tickets, checked) {
+  const byId = new Map(tickets.map(t => [t.id, t]));
+  const out = [];
+  for (const [id, v] of Object.entries(checked)) {
+    if (v.category !== 'handoff' || !v.handoffAt) continue;
+    const t = byId.get(+id);
+    if (t) out.push({ ...t, created_at: v.handoffAt });
+  }
+  return out;
+}
+
+// A ticket's creation day falls on a weekend -- excluded from the Iris
+// progress section throughout (ticket count, response/resolution time, and
+// team-handoff candidates), per instruction 2026-09-22: there's no weekend
+// staffing to measure, same rationale as the analyst dashboard's weekly-trend
+// fix. Kept as one shared predicate so every metric in the section uses the
+// same "business-day Iris tickets" population.
+const isWeekendTicket = t => [0, 6].includes(new Date(t.created_at).getUTCDay());
+
+// "Handed off to another team" for the Iris progress section: reuses the
+// cross-group routing feature's already-verified candidates/checked state
+// (GROUP_ACTIVITY_RE was confirmed against real Freshservice data 2026-08-25,
+// unlike the agent-axis regex above) rather than duplicating that machinery --
+// just scoped down to tickets created in the Iris window. Routing candidates
+// are only ever non-HD (currently-elsewhere) tickets, which is exactly what
+// "handed off to another team" means. Not "Iris-verified" in the sense of
+// confirming Iris itself touched each ticket -- same created_at-since-go-live
+// proxy extractIrisCandidates already uses for the rest of this section.
+function buildIrisTeamHandoffSummary(routingCandidates, routingChecked, sinceISO) {
+  const since = new Date(sinceISO);
+  const windowCandidates = routingCandidates.filter(c => new Date(c.created_at) >= since && !isWeekendTicket(c));
+  const windowChecked = windowCandidates.map(c => routingChecked[c.id]).filter(Boolean);
+  const routedOut = windowChecked.filter(r => r.routedOut);
+  return {
+    totalCandidates: windowCandidates.length,
+    totalChecked: windowChecked.length,
+    routedOutCount: routedOut.length,
+  };
+}
+
 function calcStats(tickets) {
   const res = tickets.filter(t => t.status===4||t.status===5);
   // First-response and resolution times live in the embedded `stats` object
@@ -521,7 +731,7 @@ function buildWeeklyTrend(tickets, now, monthsBack = WEEKLY_TREND_MONTHS) {
 }
 
 function buildHTML(data) {
-  const { monthly, weekly, days, overall, updated, months, current, monthTrend, quarterlyVolume = [], routingSummary, weeklyTrend = [] } = data;
+  const { monthly, weekly, days, overall, updated, months, current, monthTrend, quarterlyVolume = [], routingSummary, weeklyTrend = [], irisSummary, postHandoffStats, irisWindowStats, irisTeamHandoffSummary } = data;
   const cur = monthly[current.key] || {};
   const wkColors = ['#2B5CE6','#1A7A52','#9B5DE5','#F15BB5','#00BBF9'];
   const wkLabels = JSON.stringify(weekly.map(w=>w.label));
@@ -675,6 +885,44 @@ hr{border:none;border-top:1px solid var(--border);margin:32px 0}
   </div>
   <div class="insight"><strong>SLA compliance</strong> averages two Freshservice-native flags: whether each ticket met its <em>first-response</em> SLA and whether it met its <em>resolution</em> SLA (the actual time thresholds behind those are set in Freshservice's own SLA policy, not in this dashboard). "FR → resolution" (below, in Weekly trends) is avg resolution time minus avg first-response time — roughly how long after first responding a ticket takes to actually close, not a per-ticket average of that exact gap. "Improving"/"Worsening" compares the last complete month to the one before it.</div>
 </div>
+
+${irisSummary ? `
+<div class="section">
+  <div class="section-header"><span class="section-label">Iris — progress since ${new Date(IRIS_LIVE_SINCE).toLocaleString('en-US',{month:'short',day:'numeric',year:'numeric',timeZone:'UTC'})}</span><div class="section-rule"></div></div>
+  <div class="kpi-grid-4">
+    <div class="kpi-card"><div class="kpi-label">Tickets tracked</div><div class="kpi-value">${(irisWindowStats?.total||0).toLocaleString()}</div><div class="kpi-sub">created since go-live</div></div>
+    <div class="kpi-card"><div class="kpi-label">Avg response time</div><div class="kpi-value">${fmt(irisWindowStats?.avgFRT)}</div><div class="kpi-sub">all tickets in window</div></div>
+    <div class="kpi-card"><div class="kpi-label">Avg resolution time</div><div class="kpi-value">${fmt(irisWindowStats?.avgTTR)}</div><div class="kpi-sub">all tickets in window</div></div>
+    <div class="kpi-card${irisSummary.pendingVerification ? '' : ' blue'}"><div class="kpi-label">Handed off to an agent</div><div class="kpi-value">${irisSummary.pendingVerification ? 'Pending' : irisSummary.handoff.toLocaleString()}</div><div class="kpi-sub">Iris → human, stayed in HD</div></div>
+  </div>
+  <div class="kpi-grid-3" style="margin-top:12px">
+    <div class="kpi-card amber"><div class="kpi-label">Handed off to another team</div><div class="kpi-value">${(irisTeamHandoffSummary?.routedOutCount||0).toLocaleString()}</div><div class="kpi-sub">confirmed so far</div></div>
+    <div class="kpi-card"><div class="kpi-label">Team-handoff candidates</div><div class="kpi-value">${(irisTeamHandoffSummary?.totalCandidates||0).toLocaleString()}</div><div class="kpi-sub">currently in another group</div></div>
+    <div class="kpi-card"><div class="kpi-label">Checked so far</div><div class="kpi-value">${(irisTeamHandoffSummary?.totalChecked||0).toLocaleString()}</div><div class="kpi-sub">${irisTeamHandoffSummary?.totalCandidates ? Math.round(irisTeamHandoffSummary.totalChecked / irisTeamHandoffSummary.totalCandidates * 100) : 0}% of candidates</div></div>
+  </div>
+  <div class="insight"><strong>Notes:</strong> tickets created on a Saturday or Sunday are excluded from every number in this section (no weekend staffing to measure). Response/resolution time otherwise cover every business-day ticket created since Iris went live, not just ones confirmed Iris touched. "Handed off to another team" reuses the cross-group routing check below (already verified against real Freshservice data) scoped to this window — its candidate list only refreshes on a full resync, so a very recent team handoff may not be a candidate yet. "Handed off to an agent" stays "Pending" until Iris's own activity-log format is confirmed against a real handoff — see the ticket-categorization caveat just below.</div>
+</div>
+
+<div class="section">
+  <div class="section-header"><span class="section-label">Iris — ticket categorization</span><div class="section-rule"></div></div>
+  ${irisSummary.pendingVerification ? `<div class="insight"><strong>Pending verification:</strong> Iris's Freshservice activity-log format hasn't been confirmed yet against a real Iris→human handoff, so the categories below are intentionally held at "Pending" rather than showing a guessed number. ${irisSummary.totalChecked.toLocaleString()} of ${irisSummary.totalCandidates.toLocaleString()} candidate tickets (created since ${IRIS_LIVE_SINCE.slice(0,10)}) have been checked so far.</div>` : ''}
+  <div class="kpi-grid-4">
+    <div class="kpi-card${irisSummary.pendingVerification ? '' : ' green'}"><div class="kpi-label">Resolved by Iris</div><div class="kpi-value">${irisSummary.pendingVerification ? 'Pending' : irisSummary.fullyIris.toLocaleString()}</div><div class="kpi-sub">fully handled, no human needed</div></div>
+    <div class="kpi-card${irisSummary.pendingVerification ? '' : ' blue'}"><div class="kpi-label">Reassigned to human</div><div class="kpi-value">${irisSummary.pendingVerification ? 'Pending' : irisSummary.handoff.toLocaleString()}</div><div class="kpi-sub">handed off after Iris</div></div>
+    <div class="kpi-card"><div class="kpi-label">Reviewed, notes added</div><div class="kpi-value">Not yet tracked</div><div class="kpi-sub">planned follow-up — needs the conversations API</div></div>
+    <div class="kpi-card${irisSummary.pendingVerification ? '' : ' green'}"><div class="kpi-label">Fully handled by Iris</div><div class="kpi-value">${irisSummary.pendingVerification ? 'Pending' : irisSummary.fullyHandledByIris.toLocaleString()}</div><div class="kpi-sub">resolved + reassigned</div></div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-header"><span class="section-label">Post-handoff performance — human agents, clock restarted at handoff</span><div class="section-rule"></div></div>
+  ${irisSummary.pendingVerification ? `<div class="insight">Same pending-verification caveat as above — post-handoff timing depends on the same handoff-timestamp detection.</div>` : ''}
+  <div class="kpi-grid-3">
+    <div class="kpi-card"><div class="kpi-label">Handed-off tickets</div><div class="kpi-value">${(postHandoffStats?.total||0).toLocaleString()}</div><div class="kpi-sub">with a known handoff time</div></div>
+    <div class="kpi-card"><div class="kpi-label">Avg response (post-handoff)</div><div class="kpi-value">${fmt(postHandoffStats?.avgFRT)}</div><div class="kpi-sub">from handoff, not ticket creation</div></div>
+    <div class="kpi-card"><div class="kpi-label">Avg resolution (post-handoff)</div><div class="kpi-value">${fmt(postHandoffStats?.avgTTR)}</div><div class="kpi-sub">from handoff, not ticket creation</div></div>
+  </div>
+</div>` : ''}
 
 <div class="section">
   <div class="section-header"><span class="section-label">Monthly breakdown — all statuses including pending</span><div class="section-rule"></div></div>
@@ -928,6 +1176,37 @@ async function main() {
     })),
   };
 
+  // Iris involvement: resolve the bot's agent id once (cached in
+  // iris-history.json so we don't re-fetch the agent directory every run),
+  // then check candidates the same budget-capped way routing does. Unlike
+  // routing candidates, the candidate list is cheap to rebuild every run --
+  // it's just filtering `all` (already in memory), not a second all-groups
+  // page-through -- so it doesn't need to be gated behind a full resync.
+  const irisState = loadIrisState();
+  if (!irisState.irisAgentId) {
+    console.log('Resolving Iris agent id...');
+    const agents = await fetchAgentDirectoryMinimal();
+    const iris = resolveIrisAgent(agents);
+    if (iris) { irisState.irisAgentId = iris.id; irisState.irisAgentName = iris.name; }
+    else console.warn(`WARNING: no Freshservice agent found for ${IRIS_EMAIL} — Iris tracking will stay empty until this resolves.`);
+  }
+  irisState.candidates = extractIrisCandidates(all);
+  irisState.checked = await updateIrisHistory(irisState.candidates, irisState.checked, {
+    irisAgentId: irisState.irisAgentId, irisAgentName: irisState.irisAgentName,
+  });
+  saveIrisState(irisState);
+  const irisSummary = irisState.irisAgentId ? buildIrisSummary(irisState.candidates, irisState.checked) : null;
+  const postHandoffStats = calcStats(buildPostHandoffTickets(all, irisState.checked));
+
+  // Iris progress section: overall response/resolution time for the Iris
+  // window is a plain calcStats() over tickets created since go-live -- no
+  // activity-log parsing needed, so unlike the categorization above it's real
+  // from day one. "Handed off to another team" reuses the routing state
+  // already built above, scoped to the same window.
+  const irisSince = new Date(IRIS_LIVE_SINCE);
+  const irisWindowStats = calcStats(all.filter(t => new Date(t.created_at) >= irisSince && !isWeekendTicket(t)));
+  const irisTeamHandoffSummary = buildIrisTeamHandoffSummary(routingState.candidates, routingState.checked, IRIS_LIVE_SINCE);
+
   const quarterlyVolume = [];
   for (let y = WINDOW_START.getUTCFullYear(); y <= now.getUTCFullYear(); y++) {
     quarterlyVolume.push(...buildQuarterlyVolume(all, y, now));
@@ -959,7 +1238,7 @@ async function main() {
   } : null;
 
   const updated = now.toLocaleString('en-US',{timeZone:'America/New_York',month:'short',day:'numeric',year:'numeric',hour:'2-digit',minute:'2-digit'})+' ET';
-  const html = buildHTML({monthly,months,current,weekly,days,overall,updated,monthTrend,quarterlyVolume,routingSummary,weeklyTrend});
+  const html = buildHTML({monthly,months,current,weekly,days,overall,updated,monthTrend,quarterlyVolume,routingSummary,weeklyTrend,irisSummary,postHandoffStats,irisWindowStats,irisTeamHandoffSummary});
   fs.writeFileSync('index.html',html);
   console.log(`Dashboard written — ${html.length} chars, ${all.length} tickets processed`);
 }
@@ -974,4 +1253,7 @@ module.exports = {
   buildQuarterlyVolume, yoyQuarterDelta, buildWeeklyTrend,
   extractRoutingCandidates, extractGroupHistory, classifyRouting, fetchTicketActivities,
   loadRoutingState, saveRoutingState, updateRoutingHistory,
+  fetchAgentDirectoryMinimal, resolveIrisAgent, extractResponderHistory, classifyIrisInvolvement,
+  extractIrisCandidates, loadIrisState, saveIrisState, updateIrisHistory, buildIrisSummary, buildPostHandoffTickets,
+  isWeekendTicket, buildIrisTeamHandoffSummary,
 };

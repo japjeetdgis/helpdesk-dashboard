@@ -4,6 +4,9 @@ const {
   fetchAllTickets, pageTickets, nextDelayMs, mergeTickets, projectTicket, calcStats, buildHTML, getDays, getWeeks, listMonths, trendBadge,
   buildQuarterlyVolume, yoyQuarterDelta, buildWeeklyTrend,
   extractRoutingCandidates, extractGroupHistory, classifyRouting, fetchTicketActivities, updateRoutingHistory,
+  fetchAgentDirectoryMinimal, resolveIrisAgent, extractResponderHistory, classifyIrisInvolvement,
+  extractIrisCandidates, updateIrisHistory, buildIrisSummary, buildPostHandoffTickets,
+  isWeekendTicket, buildIrisTeamHandoffSummary,
 } = require('./generate-dashboard.js');
 
 const HD_GROUP = 17000367080;
@@ -252,13 +255,13 @@ test('K. buildHTML renders the current month and full history dynamically', () =
 
 // --- incremental sync -------------------------------------------------------
 
-test('L. projectTicket keeps only the non-PII metric fields plus requester_id/type', () => {
+test('L. projectTicket keeps only the non-PII metric fields plus requester_id/responder_id/type', () => {
   const p = projectTicket({
     id: 1, group_id: HD_GROUP, created_at: 'c', status: 2, fr_escalated: false, is_escalated: false,
-    subject: 'SECRET', description_text: 'PII', requester_id: 42, type: 'Incident',
+    subject: 'SECRET', description_text: 'PII', requester_id: 42, responder_id: 99, type: 'Incident',
     stats: { first_responded_at: 'a', resolved_at: 'b', closed_at: 'd', agent_responded_at: 'drop' },
   });
-  assert.deepEqual(Object.keys(p).sort(), ['created_at', 'fr_escalated', 'group_id', 'id', 'is_escalated', 'requester_id', 'stats', 'status', 'type']);
+  assert.deepEqual(Object.keys(p).sort(), ['created_at', 'fr_escalated', 'group_id', 'id', 'is_escalated', 'requester_id', 'responder_id', 'stats', 'status', 'type']);
   assert.equal(p.subject, undefined);
   assert.equal(p.requester_id, 42);
   assert.equal(p.type, 'Incident');
@@ -748,4 +751,220 @@ test('AK3. buildHTML marks a week-card metric wk-up only when it actually improv
   assert.match(html, /Avg response<\/span><span class="wk-val wk-up">5\.0h/);
   assert.match(html, /Avg resolution<\/span><span class="wk-val ">22\.0h/);
   assert.match(html, /SLA<\/span><span class="wk-val wk-up">90%/);
+});
+
+// --- Iris bot involvement + post-handoff timing -----------------------------
+
+test('AL. projectTicket keeps responder_id alongside the existing non-PII fields', () => {
+  const t = projectTicket({ id: 1, group_id: HD_GROUP, requester_id: 55, responder_id: 77, type: 'Incident', created_at: 'x', status: 2, fr_escalated: false, is_escalated: false, stats: null });
+  assert.equal(t.responder_id, 77);
+});
+
+test('AL2. projectTicket defaults responder_id to null when absent', () => {
+  const t = projectTicket({ id: 1, group_id: HD_GROUP, created_at: 'x', status: 2, fr_escalated: false, is_escalated: false, stats: null });
+  assert.equal(t.responder_id, null);
+});
+
+test('AM. fetchAgentDirectoryMinimal pages /api/v2/agents and stops on a short page', async () => {
+  const calls = [];
+  const client = {
+    async get(url, config) {
+      calls.push(config.params.page);
+      if (config.params.page === 1) return { data: { agents: Array(100).fill({ id: 1, email: 'a@x.com' }) }, headers: {} };
+      return { data: { agents: [{ id: 2, email: 'b@x.com' }] }, headers: {} };
+    },
+  };
+  const agents = await fetchAgentDirectoryMinimal({ client, sleep: noSleep });
+  assert.deepEqual(calls, [1, 2]);
+  assert.equal(agents.length, 101);
+});
+
+test('AM2. resolveIrisAgent finds the bot account by email, case-insensitively', () => {
+  const agents = [{ id: 1, email: 'someone@patriotgis.com', first_name: 'A' }, { id: 99, email: 'SVC_Iris@patriotgis.com', first_name: 'Iris' }];
+  const iris = resolveIrisAgent(agents, 'SVC_iris@patriotgis.com');
+  assert.deepEqual(iris, { id: 99, name: 'Iris' });
+});
+
+test('AM3. resolveIrisAgent returns null when no agent matches', () => {
+  assert.equal(resolveIrisAgent([{ id: 1, email: 'someone@patriotgis.com' }], 'SVC_iris@patriotgis.com'), null);
+});
+
+// PLACEHOLDER activity samples -- NOT real Freshservice data, format
+// unverified (see AGENT_ACTIVITY_RE's comment in generate-dashboard.js).
+// Modeled on the real GROUP_ACTIVITY_RE samples' two known shapes (HTML vs.
+// plain-text) purely to exercise extractResponderHistory's parsing; do not
+// treat these strings as confirmed Freshservice output.
+const PLACEHOLDER_AGENT_ACTIVITY_HTML = [
+  { content: ' set Agent as <a href="/agents/500">John Analyst</a>', created_at: '2026-09-19T08:12:00Z' },
+  { content: 'created ticket, set Agent as <a href="/agents/99">Iris</a>', created_at: '2026-09-19T08:00:00Z' },
+];
+const PLACEHOLDER_AGENT_ACTIVITY_PLAINTEXT = [
+  { content: 'set Agent as John Analyst', created_at: '2026-09-19T08:12:00Z' },
+  { content: 'created ticket, set Agent as Iris', created_at: '2026-09-19T08:00:00Z' },
+];
+
+test('AN. extractResponderHistory parses a placeholder HTML activity log oldest-first', () => {
+  const history = extractResponderHistory(PLACEHOLDER_AGENT_ACTIVITY_HTML);
+  assert.deepEqual(history.map(h => h.agentId), [99, 500]);
+  assert.deepEqual(history.map(h => h.agentName), ['Iris', 'John Analyst']);
+});
+
+test('AN2. extractResponderHistory parses a placeholder plain-text activity log (no agent id available)', () => {
+  const history = extractResponderHistory(PLACEHOLDER_AGENT_ACTIVITY_PLAINTEXT);
+  assert.deepEqual(history, [{ agentId: null, agentName: 'Iris', at: '2026-09-19T08:00:00Z' }, { agentId: null, agentName: 'John Analyst', at: '2026-09-19T08:12:00Z' }]);
+});
+
+test('AO. classifyIrisInvolvement returns "unknown" unconditionally while the verification gate is off', () => {
+  // Gate-enforcement test: AGENT_ACTIVITY_RE is an unverified placeholder
+  // (see generate-dashboard.js), so this must never report a real category
+  // no matter what the activity log says -- even one that would obviously
+  // read as a full Iris→human handoff if the gate were on.
+  const result = classifyIrisInvolvement(PLACEHOLDER_AGENT_ACTIVITY_HTML, 99, 'Iris', 500);
+  assert.deepEqual(result, { category: 'unknown' });
+});
+
+test('AP. extractIrisCandidates keeps only HD tickets created on/after IRIS_LIVE_SINCE', () => {
+  const tickets = [
+    { id: 1, responder_id: 5, created_at: '2026-09-01T00:00:00Z' }, // before go-live -- excluded
+    { id: 2, responder_id: 6, created_at: '2026-09-19T00:00:00Z' }, // candidate
+  ];
+  const candidates = extractIrisCandidates(tickets, '2026-09-18T00:00:00Z');
+  assert.deepEqual(candidates.map(c => c.id), [2]);
+});
+
+test('AQ. updateIrisHistory only checks unchecked candidates, respecting the budget', async () => {
+  const candidates = [
+    { id: 1, responder_id: 5, created_at: '2026-09-19T00:00:00Z' },
+    { id: 2, responder_id: 6, created_at: '2026-09-20T00:00:00Z' },
+    { id: 3, responder_id: 7, created_at: '2026-09-21T00:00:00Z' },
+  ];
+  const checked = { 1: { category: 'none', checkedAt: 'already-done' } };
+  const client = { async get() { return { data: { activities: [] }, headers: {} }; } };
+  const updated = await updateIrisHistory(candidates, checked, { budget: 1, client, sleep: noSleep });
+  assert.equal(updated[1].checkedAt, 'already-done');
+  const newlyChecked = [2, 3].filter(id => updated[id]);
+  assert.equal(newlyChecked.length, 1);
+});
+
+test('AQ2. updateIrisHistory logs and skips a failed lookup rather than throwing', async () => {
+  const candidates = [{ id: 1, responder_id: 5, created_at: '2026-09-19T00:00:00Z' }];
+  const client = { async get() { throw new Error('boom'); } };
+  const updated = await updateIrisHistory(candidates, {}, { budget: 10, client, sleep: noSleep, maxRetries: 0 });
+  assert.equal(updated[1], undefined);
+});
+
+test('AR. buildIrisSummary rolls up category counts and flags pendingVerification', () => {
+  const candidates = [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }];
+  const checked = {
+    1: { category: 'fullyIris' }, 2: { category: 'handoff' },
+    3: { category: 'none' }, 4: { category: 'unknown' },
+  };
+  const summary = buildIrisSummary(candidates, checked);
+  assert.equal(summary.totalCandidates, 4);
+  assert.equal(summary.totalChecked, 4);
+  assert.equal(summary.fullyIris, 1);
+  assert.equal(summary.handoff, 1);
+  assert.equal(summary.fullyHandledByIris, 2);
+  assert.equal(summary.pendingVerification, true); // AGENT_ACTIVITY_RE_VERIFIED is false today
+});
+
+test('AS. buildPostHandoffTickets swaps created_at for the handoff timestamp, handoff category only', () => {
+  const tickets = [
+    { id: 1, created_at: '2026-09-19T00:00:00Z' },
+    { id: 2, created_at: '2026-09-19T00:00:00Z' },
+    { id: 3, created_at: '2026-09-19T00:00:00Z' },
+  ];
+  const checked = {
+    1: { category: 'handoff', handoffAt: '2026-09-19T08:12:00Z' },
+    2: { category: 'fullyIris' },
+    3: { category: 'handoff' }, // no handoffAt yet -- excluded, not guessed at
+  };
+  const out = buildPostHandoffTickets(tickets, checked);
+  assert.deepEqual(out.map(t => t.id), [1]);
+  assert.equal(out[0].created_at, '2026-09-19T08:12:00Z');
+});
+
+test('AT. buildHTML renders the Iris section, in a "Pending" state, when irisSummary.pendingVerification is true', () => {
+  const html = buildHTML({
+    monthly: { 'Sep 2026': calcStats([]) },
+    months: [{ key: 'Sep 2026', long: 'September 2026', isCurrent: true }],
+    current: { key: 'Sep 2026', long: 'September 2026' },
+    weekly: [], days: [], overall: calcStats([]), updated: 'x',
+    irisSummary: { totalCandidates: 40, totalChecked: 10, fullyIris: 0, handoff: 0, reviewedWithNotes: 0, fullyHandledByIris: 0, pendingVerification: true },
+    postHandoffStats: calcStats([]),
+  });
+  assert.match(html, /Iris — ticket categorization/);
+  assert.match(html, /Pending verification/);
+  assert.match(html, /Not yet tracked/);
+  assert.match(html, /Post-handoff performance/);
+});
+
+test('AT2. buildHTML renders real Iris numbers once pendingVerification is false', () => {
+  const html = buildHTML({
+    monthly: { 'Sep 2026': calcStats([]) },
+    months: [{ key: 'Sep 2026', long: 'September 2026', isCurrent: true }],
+    current: { key: 'Sep 2026', long: 'September 2026' },
+    weekly: [], days: [], overall: calcStats([]), updated: 'x',
+    irisSummary: { totalCandidates: 40, totalChecked: 40, fullyIris: 12, handoff: 8, reviewedWithNotes: 0, fullyHandledByIris: 20, pendingVerification: false },
+    postHandoffStats: calcStats([]),
+  });
+  assert.doesNotMatch(html, /Pending verification/);
+  assert.match(html, /kpi-value">12<\/div>/);
+  assert.match(html, /kpi-value">8<\/div>/);
+  assert.match(html, /kpi-value">20<\/div>/);
+});
+
+test('AT3. buildHTML omits the Iris sections entirely when irisSummary is absent', () => {
+  const html = buildHTML({
+    monthly: { 'Sep 2026': calcStats([]) },
+    months: [{ key: 'Sep 2026', long: 'September 2026', isCurrent: true }],
+    current: { key: 'Sep 2026', long: 'September 2026' },
+    weekly: [], days: [], overall: calcStats([]), updated: 'x',
+  });
+  assert.doesNotMatch(html, /Iris — ticket categorization/);
+  assert.doesNotMatch(html, /Post-handoff performance/);
+});
+
+// --- Iris progress section: weekend exclusion + team handoffs ---------------
+
+test('AU. isWeekendTicket flags Saturday/Sunday-created tickets, not weekdays', () => {
+  assert.equal(isWeekendTicket({ created_at: '2026-09-19T10:00:00Z' }), true);  // Sat
+  assert.equal(isWeekendTicket({ created_at: '2026-09-20T10:00:00Z' }), true);  // Sun
+  assert.equal(isWeekendTicket({ created_at: '2026-09-18T10:00:00Z' }), false); // Fri
+  assert.equal(isWeekendTicket({ created_at: '2026-09-21T10:00:00Z' }), false); // Mon
+});
+
+test('AV. buildIrisTeamHandoffSummary counts routed-out candidates in-window, excluding weekend-created and pre-go-live tickets', () => {
+  const candidates = [
+    { id: 1, created_at: '2026-09-10T00:00:00Z' }, // before go-live -- excluded
+    { id: 2, created_at: '2026-09-19T00:00:00Z' }, // Sat -- excluded
+    { id: 3, created_at: '2026-09-16T00:00:00Z' }, // Wed, in window
+    { id: 4, created_at: '2026-09-17T00:00:00Z' }, // Thu, in window, not yet checked
+  ];
+  const checked = {
+    3: { routedOut: true, currentGroupName: 'Security Engineering' },
+  };
+  const summary = buildIrisTeamHandoffSummary(candidates, checked, '2026-09-14T00:00:00Z');
+  assert.equal(summary.totalCandidates, 2); // 3 and 4
+  assert.equal(summary.totalChecked, 1);    // only 3 has a checked entry
+  assert.equal(summary.routedOutCount, 1);
+});
+
+test('AW. buildHTML renders the Iris progress section with response/resolution time and team-handoff counts', () => {
+  const html = buildHTML({
+    monthly: { 'Sep 2026': calcStats([]) },
+    months: [{ key: 'Sep 2026', long: 'September 2026', isCurrent: true }],
+    current: { key: 'Sep 2026', long: 'September 2026' },
+    weekly: [], days: [], overall: calcStats([]), updated: 'x',
+    irisSummary: { totalCandidates: 40, totalChecked: 40, fullyIris: 12, handoff: 8, reviewedWithNotes: 0, fullyHandledByIris: 20, pendingVerification: false },
+    postHandoffStats: calcStats([]),
+    irisWindowStats: { total: 55, avgFRT: 1.2, avgTTR: 6.4 },
+    irisTeamHandoffSummary: { totalCandidates: 9, totalChecked: 9, routedOutCount: 3 },
+  });
+  assert.match(html, /Iris — progress since Sep 14, 2026/);
+  assert.match(html, /kpi-value">55<\/div>/);
+  assert.match(html, />1\.2h<\/div>/);
+  assert.match(html, />6\.4h<\/div>/);
+  assert.match(html, /kpi-value">3<\/div>/); // routedOutCount
+  assert.match(html, /excluded from every number in this section/);
 });

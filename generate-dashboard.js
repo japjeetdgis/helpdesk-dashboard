@@ -149,7 +149,7 @@ async function pageTickets(sinceISO, opts = {}) {
   }
 
   const all = [];
-  let page = 1, reason = 'maxpages', lastCreated = Infinity;
+  let page = 1, reason = 'maxpages', lastCreated = Infinity, cutoffActive = stopAtCutoff;
   while (page <= maxPages) {
     let res;
     try {
@@ -172,13 +172,25 @@ async function pageTickets(sinceISO, opts = {}) {
 
     let hitCutoff = false;
     for (const t of tickets) {
-      if (stopAtCutoff) {
-        // The cutoff break below assumes created_at-desc order. Verify it holds
-        // rather than silently truncating the backfill if the API ever reorders.
+      if (cutoffActive) {
+        // The cutoff break below assumes created_at-desc order. Freshservice's
+        // offset pagination isn't guaranteed stable under concurrent writes
+        // during a long-running backfill (a ticket edited mid-fetch can shift
+        // page boundaries) -- a real reorder was hit in production 2026-09-23,
+        // ~20,700 tickets in. A single violation doesn't mean earlier pages
+        // were wrong, just that desc order can no longer be trusted from here
+        // on, so the cutoff optimization is dropped in favor of paging in
+        // full (to maxPages/empty) rather than aborting the whole run --
+        // slower, but never truncates data the way silently trusting a
+        // corrupted cutoff would.
         const c = new Date(t.created_at).getTime();
-        if (c > lastCreated) throw new Error(`Tickets not in created_at-desc order (${t.created_at} after an older row) — cutoff unsafe; aborting to avoid a truncated backfill.`);
-        lastCreated = c;
-        if (c < WINDOW_START.getTime()) { hitCutoff = true; break; }
+        if (c > lastCreated) {
+          console.warn(`  Order violation at page ${page} (${t.created_at} after an older row) — disabling early cutoff, paging in full for safety.`);
+          cutoffActive = false;
+        } else {
+          lastCreated = c;
+          if (c < WINDOW_START.getTime()) { hitCutoff = true; break; }
+        }
       }
       all.push(t);
     }

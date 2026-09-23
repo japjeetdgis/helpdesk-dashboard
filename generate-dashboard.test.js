@@ -314,16 +314,26 @@ test('N. pageTickets(stopAtCutoff=false) pages the whole delta regardless of cre
   assert.equal(raw.length, 101); // did not stop early on the pre-cutoff page
 });
 
-test('P. pageTickets(stopAtCutoff) aborts if results arrive out of created_at-desc order', async () => {
-  const outOfOrder = [
+test('P. pageTickets(stopAtCutoff) disables the early cutoff (does not abort) if results arrive out of created_at-desc order, and still returns every ticket', async () => {
+  // Real production failure, 2026-09-23: a strict abort-on-reorder here
+  // killed the whole run ~20,700 tickets in. Fixed to fall back to a full
+  // scan instead -- confirms that fallback actually completes and includes
+  // a ticket on a later page that WOULD have been dropped by the cutoff.
+  const p1 = [
     ticket({ id: 1, created_at: '2026-05-10T00:00:00Z' }),
     ticket({ id: 2, created_at: '2026-05-20T00:00:00Z' }), // newer than the previous row → desc order violated
+    // pad to a full page so pagination continues to page 2 (a <100 page would
+    // stop as "lastpage" regardless of cutoff behavior, masking this test)
+    ...Array.from({ length: 98 }, (_, i) => ticket({ id: 100 + i, created_at: '2026-04-01T00:00:00Z' })),
   ];
-  const client = recordingClient((url, config) => (isProbe(config) ? ok([ticket()]) : ok(outOfOrder)));
-  await assert.rejects(
-    pageTickets('2026-03-01T00:00:00Z', { client, sleep: noSleep, stopAtCutoff: true }),
-    /created_at-desc order/,
-  );
+  const p2 = [ticket({ id: 3, created_at: '2024-06-01T00:00:00Z' })]; // pre-WINDOW_START (2025-01-01) -- would have hit cutoff if still active
+  const client = recordingClient((url, config) => {
+    if (isProbe(config)) return ok([ticket()]);
+    return ok(config.params.page === 1 ? p1 : p2);
+  });
+  const raw = await pageTickets('2026-03-01T00:00:00Z', { client, sleep: noSleep, stopAtCutoff: true });
+  assert.equal(raw.length, 101, 'all of page 1 plus page 2 -- nothing dropped');
+  assert.ok(raw.some(t => t.id === 3), 'the pre-WINDOW_START ticket on page 2 must not be dropped by a cutoff that should have been disabled');
 });
 
 test('Q. trendBadge marks a lower value as Improving (green)', () => {

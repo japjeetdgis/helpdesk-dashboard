@@ -789,19 +789,23 @@ test('AM3. resolveIrisAgent returns null when no agent matches', () => {
   assert.equal(resolveIrisAgent([{ id: 1, email: 'someone@patriotgis.com' }], 'SVC_iris@patriotgis.com'), null);
 });
 
-// PLACEHOLDER activity samples -- NOT real Freshservice data, format
-// unverified (see AGENT_ACTIVITY_RE's comment in generate-dashboard.js).
-// Modeled on the real GROUP_ACTIVITY_RE samples' two known shapes (HTML vs.
-// plain-text) purely to exercise extractResponderHistory's parsing; do not
-// treat these strings as confirmed Freshservice output.
+// PLACEHOLDER HTML sample -- NOT real Freshservice data, still unverified
+// (see AGENT_ACTIVITY_RE's comment in generate-dashboard.js). Modeled on
+// GROUP_ACTIVITY_RE's HTML shape purely to exercise the parsing branch.
 const PLACEHOLDER_AGENT_ACTIVITY_HTML = [
   { content: ' set Agent as <a href="/agents/500">John Analyst</a>', created_at: '2026-09-19T08:12:00Z' },
   { content: 'created ticket, set Agent as <a href="/agents/99">Iris</a>', created_at: '2026-09-19T08:00:00Z' },
 ];
-const PLACEHOLDER_AGENT_ACTIVITY_PLAINTEXT = [
-  { content: 'set Agent as John Analyst', created_at: '2026-09-19T08:12:00Z' },
-  { content: 'created ticket, set Agent as Iris', created_at: '2026-09-19T08:00:00Z' },
-];
+
+// REAL activity content, from ticket #INC-170530's Freshservice Activity feed
+// (pasted by Japjeet 2026-09-23; UI text, not a confirmed raw API payload).
+// Freshservice's real API returns activities newest-first (extractGroupHistory
+// above documents the same contract). CREATION is the exact shape that broke
+// the original placeholder regex: multiple "set X as Y" sub-actions bundled
+// into one activity's content, separated by newlines, not commas.
+const REAL_170530_CREATION = { content: 'set Group as Iris Bot\nset Agent as Iris Bot\nSystem initiated Web Request Send to Iris successfully\nWorkflow Ends', created_at: '2026-09-23T10:00:00Z' };
+const REAL_170530_TEAM_HANDOFF = { content: 'set Agent as none and set Group as Salesforce Team', created_at: '2026-09-23T11:00:00Z' };
+const REAL_AGENT_ACTIVITY_170530 = [REAL_170530_TEAM_HANDOFF, REAL_170530_CREATION]; // newest-first, as the real API returns
 
 test('AN. extractResponderHistory parses a placeholder HTML activity log oldest-first', () => {
   const history = extractResponderHistory(PLACEHOLDER_AGENT_ACTIVITY_HTML);
@@ -809,18 +813,47 @@ test('AN. extractResponderHistory parses a placeholder HTML activity log oldest-
   assert.deepEqual(history.map(h => h.agentName), ['Iris', 'John Analyst']);
 });
 
-test('AN2. extractResponderHistory parses a placeholder plain-text activity log (no agent id available)', () => {
-  const history = extractResponderHistory(PLACEHOLDER_AGENT_ACTIVITY_PLAINTEXT);
-  assert.deepEqual(history, [{ agentId: null, agentName: 'Iris', at: '2026-09-19T08:00:00Z' }, { agentId: null, agentName: 'John Analyst', at: '2026-09-19T08:12:00Z' }]);
+test('AN2. extractResponderHistory parses the real #INC-170530 sample: stops at a newline instead of swallowing trailing workflow text', () => {
+  const history = extractResponderHistory(REAL_AGENT_ACTIVITY_170530);
+  // Only one real agent entry: "none" (the team-handoff line) is filtered out,
+  // not counted as a handoff target. Regression check for the original bug:
+  // agentName must be exactly "Iris Bot", not "Iris Bot\nSystem initiated...".
+  assert.deepEqual(history, [{ agentId: null, agentName: 'Iris Bot', at: '2026-09-23T10:00:00Z' }]);
 });
 
-test('AO. classifyIrisInvolvement returns "unknown" unconditionally while the verification gate is off', () => {
-  // Gate-enforcement test: AGENT_ACTIVITY_RE is an unverified placeholder
-  // (see generate-dashboard.js), so this must never report a real category
-  // no matter what the activity log says -- even one that would obviously
-  // read as a full Iris→human handoff if the gate were on.
-  const result = classifyIrisInvolvement(PLACEHOLDER_AGENT_ACTIVITY_HTML, 99, 'Iris', 500);
-  assert.deepEqual(result, { category: 'unknown' });
+test('AN2b. extractResponderHistory drops "none" (Iris clearing its own assignment before a team handoff) as not a real agent', () => {
+  const history = extractResponderHistory([REAL_170530_TEAM_HANDOFF]);
+  assert.deepEqual(history, []);
+});
+
+test('AO. classifyIrisInvolvement reports real categories now the gate is on, verified against #INC-170530', () => {
+  // This real ticket left HD (moved to Salesforce Team) so production would
+  // never pass it to this function at all -- extractIrisCandidates only ever
+  // builds candidates from currently-HD tickets. Exercised here anyway to
+  // confirm the function degrades sanely (no crash, no fabricated agent) when
+  // the only history entry is Iris itself and the "none" line is filtered.
+  const result = classifyIrisInvolvement(REAL_AGENT_ACTIVITY_170530, 17005072760, 'Iris Bot', null);
+  assert.equal(result.category, 'handoff');
+  assert.equal(result.handoffAt, null, 'no real non-Iris agent entry exists once "none" is filtered out');
+});
+
+test('AO2. classifyIrisInvolvement reports fullyIris when the current responder is still Iris', () => {
+  const result = classifyIrisInvolvement(REAL_AGENT_ACTIVITY_170530, 17005072760, 'Iris Bot', 17005072760);
+  assert.deepEqual(result, { category: 'fullyIris' });
+});
+
+test('AO3. classifyIrisInvolvement reports handoff with a real handoffAt when a named human agent follows Iris', () => {
+  // The named-human reassignment line itself is modeled on the confirmed
+  // single-line "set Agent as <Name>" shape (proven correct by the real
+  // "Iris Bot" and "none" cases above) -- not itself an observed sample.
+  const activities = [
+    { content: 'set Agent as Kelly Anderson', created_at: '2026-09-23T10:30:00Z' }, // newest
+    REAL_170530_CREATION, // oldest
+  ];
+  const result = classifyIrisInvolvement(activities, 17005072760, 'Iris Bot', 42);
+  assert.equal(result.category, 'handoff');
+  assert.equal(result.handoffAt, '2026-09-23T10:30:00Z');
+  assert.equal(result.handoffToAgentId, 42);
 });
 
 test('AP. extractIrisCandidates keeps only HD tickets created on/after IRIS_LIVE_SINCE', () => {
@@ -865,7 +898,7 @@ test('AR. buildIrisSummary rolls up category counts and flags pendingVerificatio
   assert.equal(summary.fullyIris, 1);
   assert.equal(summary.handoff, 1);
   assert.equal(summary.fullyHandledByIris, 2);
-  assert.equal(summary.pendingVerification, true); // AGENT_ACTIVITY_RE_VERIFIED is false today
+  assert.equal(summary.pendingVerification, false); // AGENT_ACTIVITY_RE_VERIFIED flipped true 2026-09-23
 });
 
 test('AS. buildPostHandoffTickets swaps created_at for the handoff timestamp, handoff category only', () => {
@@ -927,17 +960,17 @@ test('AT3. buildHTML omits the Iris sections entirely when irisSummary is absent
 
 // --- Iris progress section: weekend exclusion + team handoffs ---------------
 
-test('AU. isWeekendTicket flags Saturday/Sunday-created tickets, not weekdays', () => {
-  assert.equal(isWeekendTicket({ created_at: '2026-09-19T10:00:00Z' }), true);  // Sat
+test('AU. isWeekendTicket flags only Sunday-created tickets -- Saturday counts as a business day', () => {
   assert.equal(isWeekendTicket({ created_at: '2026-09-20T10:00:00Z' }), true);  // Sun
+  assert.equal(isWeekendTicket({ created_at: '2026-09-19T10:00:00Z' }), false); // Sat
   assert.equal(isWeekendTicket({ created_at: '2026-09-18T10:00:00Z' }), false); // Fri
   assert.equal(isWeekendTicket({ created_at: '2026-09-21T10:00:00Z' }), false); // Mon
 });
 
-test('AV. buildIrisTeamHandoffSummary counts routed-out candidates in-window, excluding weekend-created and pre-go-live tickets', () => {
+test('AV. buildIrisTeamHandoffSummary counts routed-out candidates in-window, excluding Sunday-created and pre-go-live tickets', () => {
   const candidates = [
     { id: 1, created_at: '2026-09-10T00:00:00Z' }, // before go-live -- excluded
-    { id: 2, created_at: '2026-09-19T00:00:00Z' }, // Sat -- excluded
+    { id: 2, created_at: '2026-09-20T00:00:00Z' }, // Sun -- excluded
     { id: 3, created_at: '2026-09-16T00:00:00Z' }, // Wed, in window
     { id: 4, created_at: '2026-09-17T00:00:00Z' }, // Thu, in window, not yet checked
   ];

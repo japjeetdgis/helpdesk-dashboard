@@ -457,16 +457,26 @@ function resolveIrisAgent(agents, email = IRIS_EMAIL) {
   return a ? { id: a.id, name: [a.first_name, a.last_name].filter(Boolean).join(' ') || a.email } : null;
 }
 
-// PLACEHOLDER -- unverified against a real Freshservice activity log. Iris
-// only went live 2026-09-18 and there's no local Freshservice API access in
-// this environment to pull a real "agent reassigned" sample, so this is a
-// best-guess pattern modeled on GROUP_ACTIVITY_RE's two known forms (HTML vs.
-// plain-text). AGENT_ACTIVITY_RE_VERIFIED below keeps this from being trusted
-// until it's confirmed against a real GET /tickets/{id}/activities response
-// for a ticket that actually got reassigned from Iris to a human.
-const AGENT_ACTIVITY_RE = /set Agent as (?:<a[^>]*href="\/agents\/(\d+)"[^>]*>([^<]*)<\/a>|([^,<]+?)(?=,| and |$))/;
+// Verified 2026-09-23 against ticket #INC-170530's real Activity feed (pasted
+// by Japjeet from the Freshservice web UI -- not a confirmed raw API JSON
+// payload, so the HTML-anchor branch below is still unverified; only the
+// plain-text branch has been seen for real). That sample exposed a real bug
+// in the original placeholder: Freshservice bundles multiple sub-actions into
+// one activity's `content` on separate lines (e.g. the ticket-creation
+// auto-assign workflow: "set Group as Iris Bot\nset Agent as Iris Bot\nSystem
+// initiated...\nWorkflow Ends") -- the original pattern had no newline
+// boundary, so its non-greedy match ran straight past the line break hunting
+// for a comma/" and "/end-of-string, swallowing the trailing workflow text as
+// the "agent name" on almost every ticket's first entry. Fixed by stopping at
+// `\n` too. The same sample also showed Iris hand off with `set Agent as none
+// and set Group as <team>` when routing a ticket to another team -- "none"
+// is a real observed value here, not a placeholder guess.
+const AGENT_ACTIVITY_RE = /set Agent as (?:<a[^>]*href="\/agents\/(\d+)"[^>]*>([^<]*)<\/a>|([^,<\n]+?)(?=,| and |\n|$))/;
 
-// Same oldest-first extraction shape as extractGroupHistory.
+// Same oldest-first extraction shape as extractGroupHistory. "none" (Iris
+// clearing its own assignment, always paired with a group change to another
+// team -- see AGENT_ACTIVITY_RE's comment) isn't a real agent, so it's
+// dropped here rather than counted as a handoff target.
 function extractResponderHistory(activities) {
   return [...activities].reverse()
     .map(a => {
@@ -474,16 +484,21 @@ function extractResponderHistory(activities) {
       if (!m) return null;
       const agentId = m[1] ? +m[1] : null;
       const agentName = (m[2] ?? m[3] ?? '').trim();
-      return agentName ? { agentId, agentName, at: a.created_at } : null;
+      if (!agentName || agentName.toLowerCase() === 'none') return null;
+      return { agentId, agentName, at: a.created_at };
     })
     .filter(Boolean);
 }
 
-// Verification gate -- flip to true only after confirming AGENT_ACTIVITY_RE
-// against a real activity log (see the comment above it). While false,
-// classifyIrisInvolvement always returns 'unknown', so the dashboard never
-// shows a guessed category. Test AL5 enforces this can't be silently removed.
-const AGENT_ACTIVITY_RE_VERIFIED = false;
+// Verification gate -- flipped true 2026-09-23 against the real sample above.
+// While false, classifyIrisInvolvement always returned 'unknown', so the
+// dashboard never showed a guessed category. Test AL5 (updated) now confirms
+// a real ticket's history classifies correctly instead of just checking the
+// gate is off. Residual risk: the HTML-anchor branch (personal/admin session
+// rendering) is still unverified against a raw API response, the same class
+// of gap that broke GROUP_ACTIVITY_RE once already (see its own comment) --
+// worth spot-checking the next real run's output before trusting it blindly.
+const AGENT_ACTIVITY_RE_VERIFIED = true;
 
 // Once verified, classifies a ticket as:
 //   'fullyIris' -- Iris held it and still does (current responder is Iris)
@@ -580,13 +595,15 @@ function buildPostHandoffTickets(tickets, checked) {
   return out;
 }
 
-// A ticket's creation day falls on a weekend -- excluded from the Iris
-// progress section throughout (ticket count, response/resolution time, and
-// team-handoff candidates), per instruction 2026-09-22: there's no weekend
-// staffing to measure, same rationale as the analyst dashboard's weekly-trend
-// fix. Kept as one shared predicate so every metric in the section uses the
-// same "business-day Iris tickets" population.
-const isWeekendTicket = t => [0, 6].includes(new Date(t.created_at).getUTCDay());
+// A ticket's creation day falls outside the business week -- excluded from
+// the Iris progress section throughout (ticket count, response/resolution
+// time, and team-handoff candidates). Originally excluded both Sat/Sun per
+// instruction 2026-09-22; corrected 2026-09-23 to exclude only Sunday -- "a
+// week" for this dashboard runs Monday 12am through Saturday 11:59pm, so
+// Saturday counts as a staffed business day. Kept as one shared predicate,
+// name unchanged, so every metric in the section uses the same "business-day
+// Iris tickets" population.
+const isWeekendTicket = t => new Date(t.created_at).getUTCDay() === 0;
 
 // "Handed off to another team" for the Iris progress section: reuses the
 // cross-group routing feature's already-verified candidates/checked state
@@ -900,7 +917,7 @@ ${irisSummary ? `
     <div class="kpi-card"><div class="kpi-label">Team-handoff candidates</div><div class="kpi-value">${(irisTeamHandoffSummary?.totalCandidates||0).toLocaleString()}</div><div class="kpi-sub">currently in another group</div></div>
     <div class="kpi-card"><div class="kpi-label">Checked so far</div><div class="kpi-value">${(irisTeamHandoffSummary?.totalChecked||0).toLocaleString()}</div><div class="kpi-sub">${irisTeamHandoffSummary?.totalCandidates ? Math.round(irisTeamHandoffSummary.totalChecked / irisTeamHandoffSummary.totalCandidates * 100) : 0}% of candidates</div></div>
   </div>
-  <div class="insight"><strong>Notes:</strong> tickets created on a Saturday or Sunday are excluded from every number in this section (no weekend staffing to measure). Response/resolution time otherwise cover every business-day ticket created since Iris went live, not just ones confirmed Iris touched. "Handed off to another team" reuses the cross-group routing check below (already verified against real Freshservice data) scoped to this window — its candidate list only refreshes on a full resync, so a very recent team handoff may not be a candidate yet. "Handed off to an agent" stays "Pending" until Iris's own activity-log format is confirmed against a real handoff — see the ticket-categorization caveat just below.</div>
+  <div class="insight"><strong>Notes:</strong> tickets created on a Sunday are excluded from every number in this section (a week runs Monday 12am through Saturday 11:59pm — Saturday counts as a staffed day). Response/resolution time otherwise cover every business-day ticket created since Iris went live, not just ones confirmed Iris touched. "Handed off to another team" reuses the cross-group routing check below (already verified against real Freshservice data) scoped to this window — its candidate list only refreshes on a full resync, so a very recent team handoff may not be a candidate yet. "Handed off to an agent" stays "Pending" until Iris's own activity-log format is confirmed against a real handoff — see the ticket-categorization caveat just below.</div>
 </div>
 
 <div class="section">

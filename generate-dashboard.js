@@ -431,6 +431,17 @@ async function updateRoutingHistory(candidates, checked, opts = {}) {
 // handoff (response & resolution clocks restarted at the handoff timestamp).
 
 const IRIS_EMAIL = 'SVC_iris@patriotgis.com';
+// Fallback if this repo's FRESHSERVICE_API_KEY can't list /agents (real
+// production failure 2026-09-23: 403 Forbidden, right after routing checks
+// against /tickets/{id}/activities succeeded fine -- this key's agent
+// apparently lacks whatever permission /agents needs, separate from ticket
+// read access). Confirmed real value: resolved successfully via the sibling
+// helpdesk-dashboard-analyst repo's own agent-directory fetch, same
+// Freshservice org, same bot account. Same hardcode-a-known-id pattern this
+// file already uses for HD_GROUP -- update both if Iris is ever
+// re-provisioned with a new agent id.
+const IRIS_AGENT_ID_FALLBACK = 17005072760;
+const IRIS_AGENT_NAME_FALLBACK = 'Iris Bot';
 // Iris went live 2026-09-14 (per Japjeet directly, 2026-09-22 -- supersedes an
 // earlier ~2026-09-18 guess inferred from the "Iris Day 3 Update" email's
 // send date). Candidates are scoped to tickets created on/after this date --
@@ -1214,10 +1225,19 @@ async function main() {
   const irisState = loadIrisState();
   if (!irisState.irisAgentId) {
     console.log('Resolving Iris agent id...');
-    const agents = await fetchAgentDirectoryMinimal();
-    const iris = resolveIrisAgent(agents);
-    if (iris) { irisState.irisAgentId = iris.id; irisState.irisAgentName = iris.name; }
-    else console.warn(`WARNING: no Freshservice agent found for ${IRIS_EMAIL} — Iris tracking will stay empty until this resolves.`);
+    try {
+      const agents = await fetchAgentDirectoryMinimal();
+      const iris = resolveIrisAgent(agents);
+      if (iris) { irisState.irisAgentId = iris.id; irisState.irisAgentName = iris.name; }
+      else console.warn(`WARNING: no Freshservice agent found for ${IRIS_EMAIL} — falling back to the hardcoded id.`);
+    } catch (e) {
+      // Real failure 2026-09-23: this API key gets 403 on /agents even
+      // though ticket/activities reads work fine. Don't let a permissions
+      // gap on a directory listing block the whole run -- fall back to the
+      // known-good id (see its own comment) rather than aborting.
+      console.warn(`WARNING: fetching the agent directory failed (${e.response?.status ?? e.message}) — falling back to the hardcoded Iris agent id.`);
+    }
+    if (!irisState.irisAgentId) { irisState.irisAgentId = IRIS_AGENT_ID_FALLBACK; irisState.irisAgentName = IRIS_AGENT_NAME_FALLBACK; }
   }
   irisState.candidates = extractIrisCandidates(all);
   irisState.checked = await updateIrisHistory(irisState.candidates, irisState.checked, {
